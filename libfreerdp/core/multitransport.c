@@ -935,3 +935,17 @@ BOOL freerdp_multitransport_send_dvc(rdpContext* context, UINT32 tunnelType, con
 	LeaveCriticalSection(&multi->lock);
 	return rc;
 }
+
+BOOL freerdp_multitransport_flush_dvc(rdpContext* context, UINT32 tunnelType)
+{
+	rdpMultitransport* multi = multitransport_from_context(context);
+	if (!multi || (tunnelType != TUNNELTYPE_UDPFECR))
+		return FALSE;
+
+	BOOL rc = FALSE;
+	EnterCriticalSection(&multi->lock);
+	if (multi->reliable && (multi->reliableState == FREERDP_MULTITRANSPORT_TUNNEL_READY))
+		rc = rdpemt_flush(multi->reliable);
+	LeaveCriticalSection(&multi->lock);
+	return rc;
+}

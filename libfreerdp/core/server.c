@@ -933,6 +933,7 @@ BOOL WTSVirtualChannelManagerCheckFileDescriptorEx(HANDLE hServer, BOOL autoOpen
 			return FALSE;
 	}
 
+	BOOL tunnelWritten = FALSE;
 	while (MessageQueue_Peek(vcm->queue, &message, TRUE))
 	{
 		BYTE* buffer = nullptr;
@@ -962,6 +963,15 @@ BOOL WTSVirtualChannelManagerCheckFileDescriptorEx(HANDLE hServer, BOOL autoOpen
 
 		if (!status)
 			break;
+		if (message.id == WTS_QUEUE_TUNNEL)
+			tunnelWritten = TRUE;
+	}
+
+	if (status && tunnelWritten &&
+	    !freerdp_multitransport_flush_dvc(vcm->client->context, TUNNELTYPE_UDPFECR))
+	{
+		WLog_ERR(TAG, "cannot write dynamic channel PDUs on the UDP tunnel");
+		status = FALSE;
 	}
 
 	return status;

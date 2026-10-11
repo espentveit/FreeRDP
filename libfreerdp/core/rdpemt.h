@@ -92,6 +92,10 @@ FREERDP_LOCAL BOOL rdpemt_send_data(rdpEmt* emt, const BYTE* data, size_t length
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL rdpemt_send_subheader(rdpEmt* emt, const BYTE* subHeader, size_t length);
 
+/* Sends what rdpemt_send_data gathered on the server side. */
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL rdpemt_flush(rdpEmt* emt);
+
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL UINT32 rdpemt_get_request_id(const rdpEmt* emt);
 
@@ -151,6 +155,12 @@ WINPR_ATTR_NODISCARD
 static inline BOOL rdpemt_send_subheader(WINPR_ATTR_UNUSED rdpEmt* emt,
                                          WINPR_ATTR_UNUSED const BYTE* subHeader,
                                          WINPR_ATTR_UNUSED size_t length)
+{
+	return FALSE;
+}
+
+WINPR_ATTR_NODISCARD
+static inline BOOL rdpemt_flush(WINPR_ATTR_UNUSED rdpEmt* emt)
 {
 	return FALSE;
 }

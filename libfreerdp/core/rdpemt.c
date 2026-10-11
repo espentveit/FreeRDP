@@ -68,6 +68,9 @@
 /* Room per datagram for the TLS record header, padding and authentication tag. */
 #define TLS_RECORD_OVERHEAD 64
 
+/* The server gathers tunnel PDUs into TLS records of up to this much plaintext. */
+#define RDPEMT_SERVER_BATCH 16000
+
 struct rdp_emt
 {
 	wLog* log;
@@ -107,6 +110,9 @@ struct rdp_emt
 	 * the position of each is how much they hold */
 	wStream* out;
 	wStream* in;
+
+	/* server side: tunnel PDUs waiting to go into one TLS record, filled up to its position */
+	wStream* batch;
 };
 
 /* Drops the first count bytes of a stream that is filled up to its position. */
@@ -177,6 +183,19 @@ static BOOL emt_flush_tls(rdpEmt* emt)
 	const size_t max = rdpudp_get_max_payload(emt->udp);
 	if (max == 0)
 		return FALSE;
+	if (emt->server)
+	{
+		/* the connection is a byte stream, so the server fills each datagram */
+		const BYTE* bytes = Stream_Buffer(emt->out);
+		const size_t total = Stream_GetPosition(emt->out);
+		for (size_t offset = 0; offset < total; offset += max)
+		{
+			const size_t length = (total - offset > max) ? max : total - offset;
+			if (!rdpudp_send(emt->udp, &bytes[offset], length))
+				return FALSE;
+		}
+		return stream_consume(emt->out, total);
+	}
 	const BYTE* data = Stream_Buffer(emt->out);
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&sbuffer, data, Stream_GetPosition(emt->out));
@@ -259,6 +278,55 @@ static BOOL emt_write_pdu(rdpEmt* emt, BYTE action, const BYTE* subHeader, size_
 		return FALSE;
 	}
 	return emt_flush_tls(emt);
+}
+
+/* Writes the gathered tunnel PDUs as one TLS record. */
+WINPR_ATTR_NODISCARD
+static BOOL emt_write_batch(rdpEmt* emt)
+{
+	WINPR_ASSERT(emt);
+
+	const size_t length = emt->batch ? Stream_GetPosition(emt->batch) : 0;
+	if (length == 0)
+		return TRUE;
+	const int total = WINPR_ASSERTING_INT_CAST(int, length);
+	const int rc = SSL_write(emt->ssl, Stream_Buffer(emt->batch), total);
+	Stream_ResetPosition(emt->batch);
+	if (rc != total)
+	{
+		log_ssl_errors(emt, "SSL_write");
+		return FALSE;
+	}
+	return emt_flush_tls(emt);
+}
+
+/* Adds a tunnel data PDU to the batch, writing the batch first when it would grow too large. */
+WINPR_ATTR_NODISCARD
+static BOOL emt_batch_data(rdpEmt* emt, const BYTE* payload, size_t length)
+{
+	WINPR_ASSERT(emt);
+	WINPR_ASSERT(payload || (length == 0));
+
+	if (length > UINT16_MAX)
+		return FALSE;
+	if (!emt->batch)
+	{
+		emt->batch = Stream_New(nullptr, RDPEMT_SERVER_BATCH);
+		if (!emt->batch)
+			return FALSE;
+	}
+	if ((Stream_GetPosition(emt->batch) + RDPTUNNEL_HEADER_LENGTH + length > RDPEMT_SERVER_BATCH) &&
+	    !emt_write_batch(emt))
+		return FALSE;
+	if (!Stream_EnsureRemainingCapacity(emt->batch, RDPTUNNEL_HEADER_LENGTH + length))
+		return FALSE;
+
+	/* [MS-RDPEMT] 2.2.1.1 RDP_TUNNEL_HEADER */
+	Stream_Write_UINT8(emt->batch, RDPTUNNEL_ACTION_DATA & 0x0F);
+	Stream_Write_UINT16(emt->batch, WINPR_ASSERTING_INT_CAST(UINT16, length));
+	Stream_Write_UINT8(emt->batch, RDPTUNNEL_HEADER_LENGTH);
+	Stream_Write(emt->batch, payload, length);
+	return TRUE;
 }
 
 WINPR_ATTR_NODISCARD
@@ -657,9 +725,9 @@ static BOOL emt_start_tls(rdpEmt* emt)
 			(void)SSL_set_tlsext_host_name(emt->ssl, emt->hostname);
 	}
 
-	/* every record fits in one datagram */
+	/* every record of the client fits in one datagram, the server sends a byte stream */
 	const size_t max = rdpudp_get_max_payload(emt->udp);
-	if (max > TLS_RECORD_OVERHEAD + 512)
+	if (!emt->server && (max > TLS_RECORD_OVERHEAD + 512))
 	{
 		if (!SSL_set_max_send_fragment(emt->ssl,
 		                               WINPR_ASSERTING_INT_CAST(long, max - TLS_RECORD_OVERHEAD)))
@@ -1003,6 +1071,7 @@ void rdpemt_free(rdpEmt* emt)
 	free(emt->publicKey);
 	Stream_Free(emt->in, TRUE);
 	Stream_Free(emt->out, TRUE);
+	Stream_Free(emt->batch, TRUE);
 	DeleteCriticalSection(&emt->lock);
 	free(emt);
 }
@@ -1016,7 +1085,24 @@ BOOL rdpemt_send_data(rdpEmt* emt, const BYTE* data, size_t length)
 	EnterCriticalSection(&emt->lock);
 	if (emt->ready && !emt->failed)
 	{
-		rc = emt_write_pdu(emt, RDPTUNNEL_ACTION_DATA, nullptr, 0, data, length);
+		rc = emt->server ? emt_batch_data(emt, data, length)
+		                 : emt_write_pdu(emt, RDPTUNNEL_ACTION_DATA, nullptr, 0, data, length);
+		if (!rc)
+			emt_fail(emt, "failed to send tunnel data");
+	}
+	LeaveCriticalSection(&emt->lock);
+	return rc;
+}
+
+BOOL rdpemt_flush(rdpEmt* emt)
+{
+	WINPR_ASSERT(emt);
+
+	BOOL rc = TRUE;
+	EnterCriticalSection(&emt->lock);
+	if (emt->ready && !emt->failed && emt->batch && (Stream_GetPosition(emt->batch) > 0))
+	{
+		rc = emt_write_batch(emt);
 		if (!rc)
 			emt_fail(emt, "failed to send tunnel data");
 	}
