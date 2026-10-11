@@ -1340,8 +1340,9 @@ static BOOL transport_default_get_public_key(rdpTransport* transport, const BYTE
 	return TRUE;
 }
 
-BOOL transport_get_peer_address(rdpTransport* transport, struct sockaddr_storage* address,
-                                size_t* length)
+WINPR_ATTR_NODISCARD
+static BOOL transport_get_address(rdpTransport* transport, BOOL local,
+                                  struct sockaddr_storage* address, size_t* length)
 {
 	WINPR_ASSERT(transport);
 	WINPR_ASSERT(address);
@@ -1362,10 +1363,24 @@ BOOL transport_get_peer_address(rdpTransport* transport, struct sockaddr_storage
 	}
 
 	socklen_t len = sizeof(*address);
-	if (getpeername(sockfd, (struct sockaddr*)address, &len) != 0)
+	const int rc = local ? getsockname(sockfd, (struct sockaddr*)address, &len)
+	                     : getpeername(sockfd, (struct sockaddr*)address, &len);
+	if (rc != 0)
 		return FALSE;
 	*length = len;
 	return TRUE;
+}
+
+BOOL transport_get_peer_address(rdpTransport* transport, struct sockaddr_storage* address,
+                                size_t* length)
+{
+	return transport_get_address(transport, FALSE, address, length);
+}
+
+BOOL transport_get_local_address(rdpTransport* transport, struct sockaddr_storage* address,
+                                 size_t* length)
+{
+	return transport_get_address(transport, TRUE, address, length);
 }
 
 DWORD transport_get_event_handles(rdpTransport* transport, HANDLE* events, DWORD count)

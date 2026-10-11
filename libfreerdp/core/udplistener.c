@@ -39,16 +39,14 @@
 
 #define TAG FREERDP_TAG("core.udplistener")
 
-#define UDPLISTENER_MAX_SOCKETS 2
-#define UDPLISTENER_MAX_SESSIONS 64
-#define UDPLISTENER_DEFAULT_PORT 3389
-
 /* As for a client connection, see RDPUDP_RECEIVE_BUFFER: here it takes every session's data. */
 #define UDPLISTENER_RECEIVE_BUFFER (4 * 1024 * 1024)
 
+/* How long the thread waits for a datagram before it looks for new sockets or a stop. */
+#define UDPLISTENER_POLL_MS 200
+
 typedef struct
 {
-	BOOL used;
 	BYTE cookieHash[32];
 	udpListenerInputFn input;
 	void* custom;
@@ -59,17 +57,33 @@ typedef struct
 
 typedef struct
 {
-	CRITICAL_SECTION lock;
-	char* bindAddress;
 	UINT16 port;
+	SOCKET sockfd;
+} udpListenerSocket;
 
-	SOCKET sockets[UDPLISTENER_MAX_SOCKETS];
+typedef struct s_udp_listener udpListener;
+
+typedef struct
+{
+	udpListener* listener;
+	BOOL stop; /* read and written with the listener's lock held */
+} udpListenerThread;
+
+struct s_udp_listener
+{
+	CRITICAL_SECTION lock;
+
+	/* all three only change with the lock held; the sockets stay open while the thread runs */
+	udpListenerSocket* sockets;
 	size_t socketCount;
-	HANDLE thread;
+	udpListenerSession* sessions;
+	size_t sessionCount;
 
-	udpListenerSession sessions[UDPLISTENER_MAX_SESSIONS];
+	HANDLE thread;
+	udpListenerThread* threadCtx; /* the running thread's own stop flag */
+
 	BYTE buffer[0x10000];
-} udpListener;
+};
 
 static udpListener g_listener;
 static INIT_ONCE g_listenerOnce = INIT_ONCE_STATIC_INIT;
@@ -79,9 +93,6 @@ static BOOL CALLBACK udplistener_init(WINPR_ATTR_UNUSED PINIT_ONCE once,
                                       WINPR_ATTR_UNUSED PVOID* context)
 {
 	memset(&g_listener, 0, sizeof(g_listener));
-	g_listener.port = UDPLISTENER_DEFAULT_PORT;
-	for (size_t x = 0; x < UDPLISTENER_MAX_SOCKETS; x++)
-		g_listener.sockets[x] = INVALID_SOCKET;
 	return InitializeCriticalSectionAndSpinCount(&g_listener.lock, 4000);
 }
 
@@ -118,23 +129,32 @@ static BOOL sockaddr_equal(const struct sockaddr_storage* a, const struct sockad
 }
 
 /* Called with the lock held. */
+static void udplistener_remove_session(udpListener* listener, size_t index)
+{
+	WINPR_ASSERT(listener);
+	WINPR_ASSERT(index < listener->sessionCount);
+	listener->sessionCount--;
+	listener->sessions[index] = listener->sessions[listener->sessionCount];
+}
+
+/* Called with the lock held. */
 static void udplistener_dispatch(udpListener* listener, SOCKET sockfd, const struct sockaddr* addr,
                                  size_t addrlen, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(listener);
 
-	udpListenerSession* session = nullptr;
-	for (size_t x = 0; x < UDPLISTENER_MAX_SESSIONS; x++)
+	size_t index = listener->sessionCount;
+	for (size_t x = 0; x < listener->sessionCount; x++)
 	{
-		udpListenerSession* cur = &listener->sessions[x];
-		if (cur->used && cur->bound && sockaddr_equal(&cur->addr, addr, addrlen))
+		const udpListenerSession* cur = &listener->sessions[x];
+		if (cur->bound && sockaddr_equal(&cur->addr, addr, addrlen))
 		{
-			session = cur;
+			index = x;
 			break;
 		}
 	}
 
-	if (!session)
+	if (index == listener->sessionCount)
 	{
 		BYTE hash[32] = WINPR_C_ARRAY_INIT;
 		if (!rdpudp_get_syn_cookie_hash(data, length, hash))
@@ -142,20 +162,21 @@ static void udplistener_dispatch(udpListener* listener, SOCKET sockfd, const str
 			WLog_DBG(TAG, "dropping a datagram from an unknown client");
 			return;
 		}
-		for (size_t x = 0; x < UDPLISTENER_MAX_SESSIONS; x++)
+		for (size_t x = 0; x < listener->sessionCount; x++)
 		{
-			udpListenerSession* cur = &listener->sessions[x];
-			if (cur->used && !cur->bound && (memcmp(cur->cookieHash, hash, sizeof(hash)) == 0))
+			const udpListenerSession* cur = &listener->sessions[x];
+			if (!cur->bound && (memcmp(cur->cookieHash, hash, sizeof(hash)) == 0))
 			{
-				session = cur;
+				index = x;
 				break;
 			}
 		}
-		if (!session)
+		if (index == listener->sessionCount)
 		{
 			WLog_INFO(TAG, "dropping a SYN whose cookie hash matches no session");
 			return;
 		}
+		udpListenerSession* session = &listener->sessions[index];
 		if (addrlen > sizeof(session->addr))
 			return;
 		memcpy(&session->addr, addr, addrlen);
@@ -163,21 +184,24 @@ static void udplistener_dispatch(udpListener* listener, SOCKET sockfd, const str
 		session->bound = TRUE;
 	}
 
+	const udpListenerSession* session = &listener->sessions[index];
 	if (!session->input(session->custom, sockfd, addr, addrlen, data, length))
-		memset(session, 0, sizeof(*session));
+		udplistener_remove_session(listener, index);
 }
 
-/* Waits up to timeout milliseconds for a socket to become readable. */
-static void udplistener_wait(const udpListener* listener, UINT32 timeout)
+/* Waits up to UDPLISTENER_POLL_MS for a socket to become readable. The socket list does not
+ * change while the thread runs except by growing, which the next round picks up. */
+static void udplistener_wait(udpListener* listener)
 {
 	WINPR_ASSERT(listener);
 
 	fd_set rset;
 	FD_ZERO(&rset);
 	SOCKET highest = 0;
+	EnterCriticalSection(&listener->lock);
 	for (size_t x = 0; x < listener->socketCount; x++)
 	{
-		const SOCKET sockfd = listener->sockets[x];
+		const SOCKET sockfd = listener->sockets[x].sockfd;
 #if !defined(_WIN32)
 		if (sockfd >= FD_SETSIZE)
 			continue;
@@ -186,9 +210,10 @@ static void udplistener_wait(const udpListener* listener, UINT32 timeout)
 		if (sockfd > highest)
 			highest = sockfd;
 	}
+	LeaveCriticalSection(&listener->lock);
+
 	struct timeval tv = WINPR_C_ARRAY_INIT;
-	tv.tv_sec = WINPR_ASSERTING_INT_CAST(long, timeout / 1000);
-	tv.tv_usec = WINPR_ASSERTING_INT_CAST(long, (timeout % 1000) * 1000);
+	tv.tv_usec = UDPLISTENER_POLL_MS * 1000;
 #if defined(_WIN32)
 	(void)select(0, &rset, nullptr, nullptr, &tv);
 #else
@@ -199,17 +224,20 @@ static void udplistener_wait(const udpListener* listener, UINT32 timeout)
 WINPR_ATTR_NODISCARD
 static DWORD WINAPI udplistener_thread(LPVOID arg)
 {
-	udpListener* listener = arg;
+	udpListenerThread* ctx = arg;
+	WINPR_ASSERT(ctx);
+	udpListener* listener = ctx->listener;
 	WINPR_ASSERT(listener);
 
 	while (TRUE)
 	{
-		udplistener_wait(listener, 500);
+		udplistener_wait(listener);
 
 		EnterCriticalSection(&listener->lock);
-		for (size_t x = 0; x < listener->socketCount; x++)
+		const BOOL stop = ctx->stop;
+		for (size_t x = 0; !stop && (x < listener->socketCount); x++)
 		{
-			const SOCKET sockfd = listener->sockets[x];
+			const SOCKET sockfd = listener->sockets[x].sockfd;
 			while (TRUE)
 			{
 				struct sockaddr_storage addr = WINPR_C_ARRAY_INIT;
@@ -225,39 +253,50 @@ static DWORD WINAPI udplistener_thread(LPVOID arg)
 			}
 		}
 		LeaveCriticalSection(&listener->lock);
+		if (stop)
+			break;
 	}
 
 	ExitThread(0);
 	return 0;
 }
 
-/* Called with the lock held. */
+/* Opens the sockets of port, unless they are open. Called with the lock held. */
 WINPR_ATTR_NODISCARD
-static BOOL udplistener_open(udpListener* listener)
+static BOOL udplistener_open_port(udpListener* listener, UINT16 port)
 {
 	WINPR_ASSERT(listener);
 
-	if (listener->thread)
-		return TRUE;
+	for (size_t x = 0; x < listener->socketCount; x++)
+	{
+		if (listener->sockets[x].port == port)
+			return TRUE;
+	}
 
-	char port[16] = WINPR_C_ARRAY_INIT;
-	(void)_snprintf(port, sizeof(port), "%" PRIu16, listener->port);
+	char service[16] = WINPR_C_ARRAY_INIT;
+	(void)_snprintf(service, sizeof(service), "%" PRIu16, port);
 	struct addrinfo hints = WINPR_C_ARRAY_INIT;
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_flags = listener->bindAddress ? 0 : AI_PASSIVE;
+	hints.ai_flags = AI_PASSIVE;
 	struct addrinfo* result = nullptr;
-	if ((getaddrinfo(listener->bindAddress, port, &hints, &result) != 0) || !result)
+	if ((getaddrinfo(nullptr, service, &hints, &result) != 0) || !result)
 	{
 		WLog_ERR(TAG, "cannot resolve the UDP listening address");
 		return FALSE;
 	}
 
-	for (struct addrinfo* ai = result;
-	     ai && (listener->socketCount < UDPLISTENER_MAX_SOCKETS); ai = ai->ai_next)
+	BOOL opened = FALSE;
+	for (struct addrinfo* ai = result; ai; ai = ai->ai_next)
 	{
 		if ((ai->ai_family != AF_INET) && (ai->ai_family != AF_INET6))
 			continue;
+
+		udpListenerSocket* sockets =
+		    realloc(listener->sockets, (listener->socketCount + 1) * sizeof(udpListenerSocket));
+		if (!sockets)
+			break;
+		listener->sockets = sockets;
 
 		SOCKET sockfd = _socket(ai->ai_family, SOCK_DGRAM, IPPROTO_UDP);
 		if (sockfd == INVALID_SOCKET)
@@ -282,40 +321,22 @@ static BOOL udplistener_open(udpListener* listener)
 			continue;
 		}
 
-		listener->sockets[listener->socketCount++] = sockfd;
+		listener->sockets[listener->socketCount].port = port;
+		listener->sockets[listener->socketCount].sockfd = sockfd;
+		listener->socketCount++;
+		opened = TRUE;
 		WLog_INFO(TAG, "listening for RDP-UDP on %s port %" PRIu16,
-		          (ai->ai_family == AF_INET6) ? "IPv6" : "IPv4", listener->port);
+		          (ai->ai_family == AF_INET6) ? "IPv6" : "IPv4", port);
 	}
 	freeaddrinfo(result);
 
-	if (listener->socketCount == 0)
-	{
-		WLog_ERR(TAG, "cannot open a UDP socket on port %" PRIu16, listener->port);
-		return FALSE;
-	}
-
-	/* runs for the life of the process, like the sockets it reads */
-	listener->thread = CreateThread(nullptr, 0, udplistener_thread, listener, 0, nullptr);
-	return listener->thread != nullptr;
+	if (!opened)
+		WLog_ERR(TAG, "cannot open a UDP socket on port %" PRIu16, port);
+	return opened;
 }
 
-void udplistener_set_address(const char* bindAddress, UINT16 port)
-{
-	udpListener* listener = udplistener_get();
-	if (!listener)
-		return;
-
-	EnterCriticalSection(&listener->lock);
-	if (!listener->thread)
-	{
-		free(listener->bindAddress);
-		listener->bindAddress = bindAddress ? _strdup(bindAddress) : nullptr;
-		listener->port = port;
-	}
-	LeaveCriticalSection(&listener->lock);
-}
-
-BOOL udplistener_register(const BYTE cookieHash[32], udpListenerInputFn input, void* custom)
+BOOL udplistener_register(UINT16 port, const BYTE cookieHash[32], udpListenerInputFn input,
+                          void* custom)
 {
 	WINPR_ASSERT(cookieHash);
 	WINPR_ASSERT(input);
@@ -327,24 +348,39 @@ BOOL udplistener_register(const BYTE cookieHash[32], udpListenerInputFn input, v
 
 	BOOL rc = FALSE;
 	EnterCriticalSection(&listener->lock);
-	if (udplistener_open(listener))
+	if (!udplistener_open_port(listener, port))
+		goto out;
+
+	udpListenerSession* sessions =
+	    realloc(listener->sessions, (listener->sessionCount + 1) * sizeof(udpListenerSession));
+	if (!sessions)
+		goto out;
+	listener->sessions = sessions;
+	udpListenerSession* session = &listener->sessions[listener->sessionCount];
+	memset(session, 0, sizeof(*session));
+	memcpy(session->cookieHash, cookieHash, sizeof(session->cookieHash));
+	session->input = input;
+	session->custom = custom;
+	listener->sessionCount++;
+
+	if (!listener->thread)
 	{
-		for (size_t x = 0; x < UDPLISTENER_MAX_SESSIONS; x++)
+		udpListenerThread* ctx = calloc(1, sizeof(udpListenerThread));
+		if (ctx)
 		{
-			udpListenerSession* session = &listener->sessions[x];
-			if (session->used)
-				continue;
-			memset(session, 0, sizeof(*session));
-			session->used = TRUE;
-			memcpy(session->cookieHash, cookieHash, sizeof(session->cookieHash));
-			session->input = input;
-			session->custom = custom;
-			rc = TRUE;
-			break;
+			ctx->listener = listener;
+			listener->thread = CreateThread(nullptr, 0, udplistener_thread, ctx, 0, nullptr);
 		}
-		if (!rc)
-			WLog_WARN(TAG, "too many sessions waiting for or using RDP-UDP");
+		if (!listener->thread)
+		{
+			free(ctx);
+			listener->sessionCount--;
+			goto out;
+		}
+		listener->threadCtx = ctx;
 	}
+	rc = TRUE;
+out:
 	LeaveCriticalSection(&listener->lock);
 	return rc;
 }
@@ -355,12 +391,46 @@ void udplistener_unregister(void* custom)
 	if (!listener || !custom)
 		return;
 
+	HANDLE thread = nullptr;
+	udpListenerThread* ctx = nullptr;
+	udpListenerSocket* sockets = nullptr;
+	size_t socketCount = 0;
+
 	EnterCriticalSection(&listener->lock);
-	for (size_t x = 0; x < UDPLISTENER_MAX_SESSIONS; x++)
+	for (size_t x = 0; x < listener->sessionCount;)
 	{
-		udpListenerSession* session = &listener->sessions[x];
-		if (session->used && (session->custom == custom))
-			memset(session, 0, sizeof(*session));
+		if (listener->sessions[x].custom == custom)
+			udplistener_remove_session(listener, x);
+		else
+			x++;
+	}
+
+	/* the last session is gone: the thread ends and the sockets close */
+	if ((listener->sessionCount == 0) && listener->thread)
+	{
+		/* the thread's own flag: a session that registers before it ended starts another */
+		ctx = listener->threadCtx;
+		ctx->stop = TRUE;
+		listener->threadCtx = nullptr;
+		thread = listener->thread;
+		listener->thread = nullptr;
+		sockets = listener->sockets;
+		socketCount = listener->socketCount;
+		listener->sockets = nullptr;
+		listener->socketCount = 0;
+		free(listener->sessions);
+		listener->sessions = nullptr;
 	}
 	LeaveCriticalSection(&listener->lock);
+
+	if (thread)
+	{
+		(void)WaitForSingleObject(thread, INFINITE);
+		(void)CloseHandle(thread);
+		free(ctx);
+		WLog_DBG(TAG, "no session waits for RDP-UDP any more, closing the UDP sockets");
+	}
+	for (size_t x = 0; x < socketCount; x++)
+		closesocket(sockets[x].sockfd);
+	free(sockets);
 }

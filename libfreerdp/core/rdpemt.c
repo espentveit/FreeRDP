@@ -906,8 +906,8 @@ static BOOL emt_server_input(void* custom, SOCKET sockfd, const struct sockaddr*
 	return rc;
 }
 
-rdpEmt* rdpemt_new_server(wLog* log, UINT32 requestId, const BYTE* cookie, X509* cert,
-                          EVP_PKEY* key, rdpEmtEventFn callback, void* custom)
+rdpEmt* rdpemt_new_server(wLog* log, UINT16 port, UINT32 requestId, const BYTE* cookie,
+                          X509* cert, EVP_PKEY* key, rdpEmtEventFn callback, void* custom)
 {
 	WINPR_ASSERT(log);
 	WINPR_ASSERT(cookie);
@@ -949,7 +949,7 @@ rdpEmt* rdpemt_new_server(wLog* log, UINT32 requestId, const BYTE* cookie, X509*
 		goto fail;
 
 	emt->started = GetTickCount64();
-	if (!udplistener_register(emt->cookieHash, emt_server_input, emt))
+	if (!udplistener_register(port, emt->cookieHash, emt_server_input, emt))
 		goto fail;
 
 	emt->thread = CreateThread(nullptr, 0, emt_thread, emt, 0, nullptr);

@@ -25,13 +25,13 @@
 
 /** @brief The UDP side of a server's listening port.
  *
- * Clients send their RDP-UDP SYN to the address and port of the TCP listener ([MS-RDPEMT] 1.3).
- * One socket per address family takes every session's datagrams. A version 3 SYN carries the
- * SHA-256 hash of the security cookie its Initiate Multitransport Request handed out, which says
- * what session it is for; after that the client's address does.
+ * Clients send their RDP-UDP SYN to the address and port their TCP connection went to
+ * ([MS-RDPEMT] 1.3). One socket per address family on that port takes every session's datagrams.
+ * A version 3 SYN carries the SHA-256 hash of the security cookie its Initiate Multitransport
+ * Request handed out, which says what session it is for; after that the client's address does.
  *
- * The sockets open when the first session registers, on the address and port the TCP listener
- * was opened on.
+ * The sockets of a port open with the first session that waits on it. Everything closes, and the
+ * listener's thread ends, when the last session is gone.
  */
 
 /** Called on the listener's thread with one datagram from the client of a registered session.
@@ -39,13 +39,10 @@
 typedef BOOL (*udpListenerInputFn)(void* custom, SOCKET sockfd, const struct sockaddr* addr,
                                    size_t addrlen, const BYTE* data, size_t length);
 
-/** Remembers where the TCP listener listens, the UDP sockets open on the same address and port. */
-FREERDP_LOCAL void udplistener_set_address(const char* bindAddress, UINT16 port);
-
-/** Waits for the client whose SYN carries cookieHash. Opens the sockets if they are not open. */
+/** Waits on UDP port for the client whose SYN carries cookieHash. */
 WINPR_ATTR_NODISCARD
-FREERDP_LOCAL BOOL udplistener_register(const BYTE cookieHash[32], udpListenerInputFn input,
-                                        void* custom);
+FREERDP_LOCAL BOOL udplistener_register(UINT16 port, const BYTE cookieHash[32],
+                                        udpListenerInputFn input, void* custom);
 
 /** Removes a registration. Once it returns, input is not called for custom any more. */
 FREERDP_LOCAL void udplistener_unregister(void* custom);

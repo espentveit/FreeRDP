@@ -49,9 +49,6 @@
 
 #include "listener.h"
 #include "utils.h"
-#if defined(WITH_RDPEUDP)
-#include "udplistener.h"
-#endif
 
 #define TAG FREERDP_TAG("core.listener")
 
@@ -164,11 +161,6 @@ static BOOL freerdp_listener_open(freerdp_listener* instance, const char* bind_a
 
 	if (!res)
 		return FALSE;
-
-#if defined(WITH_RDPEUDP)
-	/* multitransport clients send their UDP datagrams to the same address and port */
-	udplistener_set_address(bind_address, port);
-#endif
 
 	for (struct addrinfo* ai = res; ai && (listener->num_sockfds < 5); ai = ai->ai_next)
 	{

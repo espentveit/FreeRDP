@@ -26,6 +26,7 @@
 #if !defined(_WIN32)
 #include <netdb.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
 #endif
 #include <freerdp/log.h>
 #include <freerdp/multitransport.h>
@@ -202,10 +203,30 @@ static BOOL multitransport_server_start_tunnel(rdpMultitransport* multi)
 		return FALSE;
 	}
 
+	/* [MS-RDPEMT] 1.3: the client sends its UDP datagrams to the address and port its TCP
+	 * connection went to */
+	struct sockaddr_storage local = WINPR_C_ARRAY_INIT;
+	size_t localLength = 0;
+	if (!transport_get_local_address(multi->rdp->transport, &local, &localLength))
+	{
+		WLog_INFO(TAG, "not offering UDP, the main connection is not on a TCP socket");
+		return FALSE;
+	}
+	UINT16 port = 0;
+	if (local.ss_family == AF_INET)
+		port = ntohs(((const struct sockaddr_in*)&local)->sin_port);
+	else if (local.ss_family == AF_INET6)
+		port = ntohs(((const struct sockaddr_in6*)&local)->sin6_port);
+	if (port == 0)
+	{
+		WLog_INFO(TAG, "not offering UDP, the main connection is not over TCP/IP");
+		return FALSE;
+	}
+
 	EVP_PKEY* evp = freerdp_key_get_evp_pkey(key);
 	if (!evp)
 		return FALSE;
-	rdpEmt* emt = rdpemt_new_server(WLog_Get(TAG), multi->reliableReqId, multi->reliableCookie,
+	rdpEmt* emt = rdpemt_new_server(WLog_Get(TAG), port, multi->reliableReqId, multi->reliableCookie,
 	                                freerdp_certificate_get_x509(cert), evp,
 	                                multitransport_tunnel_event, multi);
 	EVP_PKEY_free(evp);
