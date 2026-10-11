@@ -357,11 +357,23 @@ static UINT64 now_ms(void)
 	return GetTickCount64();
 }
 
+/* [MS-RDPEUDP] 3.1.6.1 sets 500 ms for version 1 and 300 ms for version 2. [MS-RDPEUDP2]
+ * 3.1.1.2.3 only wants the loss timeout above the delayed ACK time (20 ms, sent in DelayAckInfo);
+ * 100 ms leaves room for receivers that batch their ACKs, such as mstsc (up to ~70 ms), and a
+ * lost frame tail no longer stalls the video for 300 ms. */
 WINPR_ATTR_NODISCARD
 static UINT32 rto_floor(const rdpUdp* udp)
 {
 	WINPR_ASSERT(udp);
-	return (udp->version == RDPUDP_PROTOCOL_VERSION_1) ? 500 : 300;
+	switch (udp->version)
+	{
+		case RDPUDP_PROTOCOL_VERSION_1:
+			return 500;
+		case RDPUDP_PROTOCOL_VERSION_3:
+			return 100;
+		default:
+			return 300;
+	}
 }
 
 WINPR_ATTR_NODISCARD
