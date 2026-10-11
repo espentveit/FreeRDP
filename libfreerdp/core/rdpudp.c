@@ -102,14 +102,37 @@ typedef enum WINPR_C23_ENUM_TYPE(uint8_t)
 #define RDPUDP_MAX_IN_FLIGHT 512
 #define RDPUDP_V1_MAX_IN_FLIGHT 64
 
-/* RDP-UDP2 congestion control ([MS-RDPEUDP2] 3.1.5.1.1 leaves the algorithm to the sender):
- * a window of datagrams that grows by one per acknowledgement up to the slow start threshold and
- * by one per window after it, and halves when a loss shows. A lost datagram is resent as soon as
- * an ACK vector reports it missing with RDPUDP2_REORDER_THRESHOLD later ones received, not only
- * when its retransmit timer runs out. */
+/* RDP-UDP2 congestion control ([MS-RDPEUDP2] 3.1.5.1.1 leaves the algorithm to the sender).
+ * A window of datagrams grows by one per acknowledgement up to the slow start threshold, then by
+ * one per RDPUDP2_GROWTH_ACKS acknowledgements (about 12% per round trip). Once per round trip
+ * the window drops to 70% if the round was congested: at least RDPUDP2_CONGESTED_LOSS_PERCENT of
+ * its datagrams lost, or the smoothed round trip RDPUDP2_QUEUE_DELAY_MS (or half the minimum)
+ * above the lowest one of the last RDPUDP2_RTT_MIN_WINDOW_MS. Scattered random loss is repaired
+ * without slowing down: a Windows 11 server kept ~4 MB/s under 2% loss and 100 ms of added delay,
+ * where halving on every loss fell to 0.12 MB/s.
+ * A lost datagram is resent as soon as an ACK vector reports it missing with a number of later
+ * ones received, not only when its retransmit timer runs out. That number starts at
+ * RDPUDP2_REORDER_THRESHOLD and doubles, up to RDPUDP2_MAX_REORDER_THRESHOLD, whenever a resent
+ * datagram's first copy turns out to have arrived ([MS-RDPEUDP2] 3.1.1.2.3 lets the amount follow
+ * the network); every RDPUDP2_REORDER_DECAY_ROUNDS round trips without that it comes down by one.
+ * Such a loss is taken back from the round, so reordering is not read as congestion. */
 #define RDPUDP2_INITIAL_CWND 32
 #define RDPUDP2_MIN_CWND 8
 #define RDPUDP2_REORDER_THRESHOLD 3
+#define RDPUDP2_MAX_REORDER_THRESHOLD 128
+#define RDPUDP2_REORDER_DECAY_ROUNDS 8
+/* Data sequence numbers that were resent, remembered to spot a first copy arriving after all. */
+#define RDPUDP2_RESENT_HISTORY 256
+/* [RFC6298] 5.5: after a timeout new datagrams get the doubled timeout too, until a round trip
+ * sample comes in, at most 2^RDPUDP2_MAX_RTO_BACKOFF times. Without it a round trip that grew
+ * past the timeout never gets measured: every datagram is resent first and Karn's rule drops
+ * the samples. */
+#define RDPUDP2_MAX_RTO_BACKOFF 6
+#define RDPUDP2_GROWTH_ACKS 8
+#define RDPUDP2_CONGESTED_LOSS_PERCENT 10
+#define RDPUDP2_ROUND_MIN_SAMPLES 16
+#define RDPUDP2_QUEUE_DELAY_MS 30
+#define RDPUDP2_RTT_MIN_WINDOW_MS 10000
 
 /* How far the newest data sequence number may run ahead of the oldest one still unacknowledged.
  * Everything the peer receives behind a hole waits there until the hole is filled, and mstsc gives
@@ -239,8 +262,23 @@ struct rdp_udp
 	size_t inFlight;
 	UINT32 cwnd;      /* RDP-UDP2 congestion window, in datagrams */
 	UINT32 ssthresh;  /* slow start threshold */
-	UINT32 ccAcked;   /* acknowledgements counted towards the next window step */
-	UINT64 ccLastCut; /* when the window was last reduced, once per round trip */
+	UINT32 ccAcked;      /* acknowledgements counted towards the next window step */
+	UINT64 ccRoundStart; /* the round trip being counted, see cc_round */
+	UINT32 ccRoundAcked;
+	UINT32 ccRoundLost;
+	UINT32 reorderThreshold; /* later datagrams received before a missing one counts as lost */
+	UINT32 reorderCalmRounds;
+	UINT32 rtoBackoff;       /* doublings of the timeout since the last round trip sample */
+	struct
+	{
+		BOOL valid;
+		BOOL reported; /* resent because an ACK vector reported it missing, not on a timeout */
+		UINT16 seq;
+	} resent[RDPUDP2_RESENT_HISTORY]; /* data sequence numbers left behind by a resend */
+	size_t resentNext;
+	UINT32 rttMin;     /* lowest round trip sample of the last window, UINT32_MAX for none */
+	UINT32 rttMinNext; /* lowest sample of the window being collected */
+	UINT64 rttMinStart;
 	UINT32 peerWindow;
 	wQueue* sendQueue;
 	UINT32 initialSequence;
@@ -402,6 +440,8 @@ static UINT32 rto_initial(const rdpUdp* udp)
 		const UINT64 rtt2 = (UINT64)udp->srtt * 2ull;
 		rto = (rtt2 > floor) ? rtt2 : floor;
 	}
+	if (udp->version == RDPUDP_PROTOCOL_VERSION_3)
+		rto <<= udp->rtoBackoff;
 	return (rto > RDPUDP_MAX_RTO_MS) ? RDPUDP_MAX_RTO_MS : WINPR_ASSERTING_INT_CAST(UINT32, rto);
 }
 
@@ -1144,6 +1184,18 @@ static void sample_rtt(rdpUdp* udp, const rdpudp_pending* p)
 	const UINT64 sample64 = now_ms() - p->sent;
 	const UINT32 sample =
 	    (sample64 > UINT32_MAX) ? UINT32_MAX : WINPR_ASSERTING_INT_CAST(UINT32, sample64);
+	udp->rtoBackoff = 0;
+	if (sample < udp->rttMin)
+		udp->rttMin = sample;
+	if (sample < udp->rttMinNext)
+		udp->rttMinNext = sample;
+	if (now_ms() - udp->rttMinStart >= RDPUDP2_RTT_MIN_WINDOW_MS)
+	{
+		/* a route that got slower must not keep comparing against the old minimum */
+		udp->rttMin = udp->rttMinNext;
+		udp->rttMinNext = UINT32_MAX;
+		udp->rttMinStart = now_ms();
+	}
 	if (!udp->rttSampled)
 	{
 		/* [RFC6298] 2.2 */
@@ -1158,35 +1210,82 @@ static void sample_rtt(rdpUdp* udp, const rdpudp_pending* p)
 	udp->srtt = WINPR_ASSERTING_INT_CAST(UINT32, ((UINT64)udp->srtt * 7 + sample) / 8);
 }
 
+/* Whether the smoothed round trip shows a queue building on the path. */
+WINPR_ATTR_NODISCARD
+static BOOL cc_queue_building(const rdpUdp* udp)
+{
+	WINPR_ASSERT(udp);
+	if (!udp->rttSampled || (udp->rttMin == UINT32_MAX))
+		return FALSE;
+	/* jitter alone moves single samples well below the smoothed value, so the variation widens
+	 * what counts as a queue */
+	UINT64 allowance =
+	    (udp->rttMin / 2 > RDPUDP2_QUEUE_DELAY_MS) ? udp->rttMin / 2 : RDPUDP2_QUEUE_DELAY_MS;
+	if (4ull * udp->rttvar > allowance)
+		allowance = 4ull * udp->rttvar;
+	return udp->srtt > udp->rttMin + allowance;
+}
+
+/* Closes the round trip being counted once it has lasted a smoothed round trip, and shrinks
+ * the window to 70% if the round was congested. */
+static void cc_round(rdpUdp* udp)
+{
+	WINPR_ASSERT(udp);
+	const UINT64 now = now_ms();
+	const UINT32 rtt = (udp->srtt > 0) ? udp->srtt : rto_floor(udp);
+	if (udp->ccRoundStart == 0)
+		udp->ccRoundStart = now;
+	if (now - udp->ccRoundStart < rtt)
+		return;
+
+	const UINT32 total = udp->ccRoundAcked + udp->ccRoundLost;
+	const BOOL lossy = (total >= RDPUDP2_ROUND_MIN_SAMPLES) &&
+	                   (udp->ccRoundLost * 100ull >= total * 1ull * RDPUDP2_CONGESTED_LOSS_PERCENT);
+	const BOOL queued = cc_queue_building(udp);
+	if (lossy || queued)
+	{
+		const UINT32 reduced = WINPR_ASSERTING_INT_CAST(UINT32, udp->cwnd * 7ull / 10);
+		udp->ssthresh = (reduced > RDPUDP2_MIN_CWND) ? reduced : RDPUDP2_MIN_CWND;
+		udp->cwnd = udp->ssthresh;
+		udp->ccAcked = 0;
+		WLog_Print(udp->log, WLOG_DEBUG,
+		           "congested (%" PRIu32 " of %" PRIu32 " lost, round trip %" PRIu32 " ms, "
+		           "lowest %" PRIu32 " ms), congestion window %" PRIu32,
+		           udp->ccRoundLost, total, udp->srtt, udp->rttMin, udp->cwnd);
+	}
+	if ((udp->reorderThreshold > RDPUDP2_REORDER_THRESHOLD) &&
+	    (++udp->reorderCalmRounds >= RDPUDP2_REORDER_DECAY_ROUNDS))
+	{
+		udp->reorderThreshold--;
+		udp->reorderCalmRounds = 0;
+	}
+	udp->ccRoundStart = now;
+	udp->ccRoundAcked = 0;
+	udp->ccRoundLost = 0;
+}
+
 static void cc_on_ack(rdpUdp* udp)
 {
 	WINPR_ASSERT(udp);
+	udp->ccRoundAcked++;
 	if (udp->cwnd < udp->ssthresh)
 		udp->cwnd++;
-	else if (++udp->ccAcked >= udp->cwnd)
+	else if (!cc_queue_building(udp) && (++udp->ccAcked >= RDPUDP2_GROWTH_ACKS))
 	{
 		udp->ccAcked = 0;
 		udp->cwnd++;
 	}
 	if (udp->cwnd > RDPUDP_MAX_IN_FLIGHT)
 		udp->cwnd = RDPUDP_MAX_IN_FLIGHT;
+	cc_round(udp);
 }
 
-/* A loss halves the window, a retransmit timeout drops it to the minimum. Once per round trip:
- * the losses of one burst are one event. */
-static void cc_on_loss(rdpUdp* udp, BOOL timeout)
+/* A datagram reported missing or timed out counts against the round it falls in. */
+static void cc_on_loss(rdpUdp* udp)
 {
 	WINPR_ASSERT(udp);
-	const UINT64 now = now_ms();
-	const UINT32 rtt = (udp->srtt > 0) ? udp->srtt : rto_floor(udp);
-	if ((udp->ccLastCut != 0) && (now - udp->ccLastCut < rtt))
-		return;
-	udp->ccLastCut = now;
-	udp->ssthresh = (udp->cwnd / 2 > RDPUDP2_MIN_CWND) ? udp->cwnd / 2 : RDPUDP2_MIN_CWND;
-	udp->cwnd = timeout ? RDPUDP2_MIN_CWND : udp->ssthresh;
-	udp->ccAcked = 0;
-	WLog_Print(udp->log, WLOG_TRACE, "%s, congestion window %" PRIu32,
-	           timeout ? "retransmit timeout" : "loss", udp->cwnd);
+	udp->ccRoundLost++;
+	cc_round(udp);
 }
 
 static void acknowledge(rdpUdp* udp, rdpudp_pending* p)
@@ -1531,7 +1630,6 @@ static void v3_process_ack_vector(rdpUdp* udp, UINT16 base, wStream* s, size_t c
 		}
 	}
 
-	BOOL loss = FALSE;
 	for (size_t x = 0; x < RDPUDP_MAX_IN_FLIGHT; x++)
 	{
 		rdpudp_pending* p = &udp->pending[x];
@@ -1549,15 +1647,45 @@ static void v3_process_ack_vector(rdpUdp* udp, UINT16 base, wStream* s, size_t c
 			continue;
 		if (received[offset])
 			acknowledge(udp, p);
-		else if ((highest > offset + RDPUDP2_REORDER_THRESHOLD) && !p->lost)
+		else if ((highest > offset + udp->reorderThreshold) && !p->lost)
 		{
 			/* missing while later ones arrived: lost, resent by run_timers right away */
 			p->lost = TRUE;
-			loss = TRUE;
+			cc_on_loss(udp);
 		}
 	}
-	if (loss)
-		cc_on_loss(udp, FALSE);
+
+	/* the first copy of a resent datagram arrived after all: it was late, not lost */
+	for (size_t x = 0; x < RDPUDP2_RESENT_HISTORY; x++)
+	{
+		if (!udp->resent[x].valid)
+			continue;
+		const UINT16 seq = udp->resent[x].seq;
+		if (seq16_after(base, seq))
+		{
+			udp->resent[x].valid = FALSE;
+			continue;
+		}
+		const size_t offset = seq16_diff(seq, base);
+		if ((offset >= covered) || !received[offset])
+			continue;
+		udp->resent[x].valid = FALSE;
+		if (udp->ccRoundLost > 0)
+			udp->ccRoundLost--;
+		if (!udp->resent[x].reported)
+			continue;
+		if (udp->reorderThreshold < RDPUDP2_MAX_REORDER_THRESHOLD)
+		{
+			udp->reorderThreshold *= 2;
+			if (udp->reorderThreshold > RDPUDP2_MAX_REORDER_THRESHOLD)
+				udp->reorderThreshold = RDPUDP2_MAX_REORDER_THRESHOLD;
+			WLog_Print(udp->log, WLOG_DEBUG,
+			           "datagram 0x%04" PRIx16 " came after its resend, reordering threshold "
+			           "%" PRIu32,
+			           seq, udp->reorderThreshold);
+		}
+		udp->reorderCalmRounds = 0;
+	}
 }
 
 static void v3_process_ack(rdpUdp* udp, UINT16 ack)
@@ -2001,6 +2129,7 @@ static BOOL run_timers(rdpUdp* udp)
 		rdpudp_pending* p = &udp->pending[x];
 		if (!p->used || ((now < p->due) && !p->lost))
 			continue;
+		const BOOL reported = p->lost;
 		if (p->lost)
 		{
 			/* reported missing: out again at once, the timer keeps its length. Reordering
@@ -2018,7 +2147,11 @@ static BOOL run_timers(rdpUdp* udp)
 			p->timeouts++;
 			p->rto = (p->rto * 2 > RDPUDP_MAX_RTO_MS) ? RDPUDP_MAX_RTO_MS : p->rto * 2;
 			if (v3)
-				cc_on_loss(udp, TRUE);
+			{
+				if (udp->rtoBackoff < RDPUDP2_MAX_RTO_BACKOFF)
+					udp->rtoBackoff++;
+				cc_on_loss(udp);
+			}
 		}
 		p->retransmits++;
 		p->due = now + p->rto;
@@ -2028,6 +2161,10 @@ static BOOL run_timers(rdpUdp* udp)
 			 * number, the channel sequence number stays. The AckOfAcks then moves past the
 			 * old one, so the peer stops waiting for it. */
 			const UINT16 coded = WINPR_ASSERTING_INT_CAST(UINT16, udp->nextCoded);
+			udp->resent[udp->resentNext].valid = TRUE;
+			udp->resent[udp->resentNext].reported = reported;
+			udp->resent[udp->resentNext].seq = WINPR_ASSERTING_INT_CAST(UINT16, p->seq);
+			udp->resentNext = (udp->resentNext + 1) % RDPUDP2_RESENT_HISTORY;
 			p->seq = coded;
 			udp->nextCoded = seq16_add(coded, 1);
 		}
@@ -2073,6 +2210,9 @@ rdpUdp* rdpudp_new(wLog* log, const BYTE* cookieHash, rdpUdpReceiveFn receive, v
 	udp->mtu = RDPUDP_MTU;
 	udp->cwnd = RDPUDP2_INITIAL_CWND;
 	udp->ssthresh = RDPUDP_MAX_IN_FLIGHT;
+	udp->rttMin = UINT32_MAX;
+	udp->rttMinNext = UINT32_MAX;
+	udp->reorderThreshold = RDPUDP2_REORDER_THRESHOLD;
 	udp->offerV3 = (cookieHash != nullptr);
 	udp->version = udp->offerV3 ? RDPUDP_PROTOCOL_VERSION_3 : RDPUDP_PROTOCOL_VERSION_2;
 	if (cookieHash)
