@@ -197,6 +197,7 @@ struct rdp_udp
 {
 	wLog* log;
 	SOCKET sockfd;
+	BOOL ownsSocket; /* FALSE for a server connection, whose socket belongs to the listener */
 	RDPUDP_STATE state;
 	UINT16 version;
 	BOOL offerV3;
@@ -256,6 +257,14 @@ struct rdp_udp
 	UINT16 v3AckedSeq;       /* the SeqNum of our last ACK payload */
 	BOOL v3AckedGap;         /* whether our last acknowledgement reported a missing packet */
 	UINT16 v3NextChannel;
+
+	/* server side: the client's address on the listener's shared socket, and the SYN+ACK that
+	 * goes out again for a repeated SYN */
+	BOOL server;
+	struct sockaddr_storage peerAddr;
+	size_t peerAddrLength;
+	BYTE synAck[RDPUDP_MTU];
+	size_t synAckLength;
 
 	/* One received datagram. Kept here rather than on the stack, rdpudp_check is not reentrant. */
 	BYTE recvBuffer[0x10000];
@@ -413,7 +422,12 @@ static BOOL rdpudp_send_raw(rdpUdp* udp, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(udp);
 	WINPR_ASSERT(data);
-	const int rc = _send(udp->sockfd, (const char*)data, WINPR_ASSERTING_INT_CAST(int, length), 0);
+	const int rc =
+	    (udp->peerAddrLength > 0)
+	        ? _sendto(udp->sockfd, (const char*)data, WINPR_ASSERTING_INT_CAST(int, length), 0,
+	                  (const struct sockaddr*)&udp->peerAddr,
+	                  WINPR_ASSERTING_INT_CAST(int, udp->peerAddrLength))
+	        : _send(udp->sockfd, (const char*)data, WINPR_ASSERTING_INT_CAST(int, length), 0);
 	if (rc < 0)
 	{
 		const int error = WSAGetLastError();
@@ -1763,11 +1777,32 @@ static BOOL process_syn_ack(rdpUdp* udp, const BYTE* data, size_t length)
 	return flush_send_queue(udp);
 }
 
+/* A SYN datagram: snSourceAck -1 and the SYN flag without ACK. Nothing in the RDP-UDP2 data
+ * phase starts with four 0xFF bytes followed by those flags. */
+WINPR_ATTR_NODISCARD
+static BOOL is_syn(const BYTE* data, size_t length)
+{
+	WINPR_ASSERT(data || (length == 0));
+	if (length < 8)
+		return FALSE;
+	const UINT16 flags = (UINT16)((data[6] << 8) | data[7]);
+	return (data[0] == 0xFF) && (data[1] == 0xFF) && (data[2] == 0xFF) && (data[3] == 0xFF) &&
+	       ((flags & (RDPUDP_FLAG_SYN | RDPUDP_FLAG_ACK)) == RDPUDP_FLAG_SYN);
+}
+
 WINPR_ATTR_NODISCARD
 static BOOL process_datagram(rdpUdp* udp, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(udp);
 	WINPR_ASSERT(data);
+
+	/* the client did not get our SYN+ACK and sends its SYN again */
+	if (udp->server && is_syn(data, length))
+	{
+		WLog_Print(udp->log, WLOG_DEBUG, "repeated SYN, sending the SYN+ACK again");
+		return rdpudp_send_raw(udp, udp->synAck, udp->synAckLength);
+	}
+
 	const UINT64 now = now_ms();
 	v3_note_silence(udp, now);
 	udp->lastReceived = now;
@@ -1813,8 +1848,8 @@ static BOOL run_timers(rdpUdp* udp)
 	const BOOL v3 = udp->version == RDPUDP_PROTOCOL_VERSION_3;
 	if (now - udp->lastReceived > (v3 ? RDPUDP2_PEER_TIMEOUT_MS : RDPUDP_PEER_TIMEOUT_MS))
 	{
-		rdpudp_fail(udp, v3 ? "nothing heard from the server for 16 seconds"
-		                    : "nothing heard from the server for 65 seconds");
+		rdpudp_fail(udp, v3 ? "nothing heard from the peer for 16 seconds"
+		                    : "nothing heard from the peer for 65 seconds");
 		return FALSE;
 	}
 	v3_note_silence(udp, now);
@@ -1824,7 +1859,7 @@ static BOOL run_timers(rdpUdp* udp)
 	    (udp->bufferingSince > udp->lastDelivery) ? udp->bufferingSince : udp->lastDelivery;
 	if ((udp->buffered > 0) && (now - progress > RDPUDP_STALL_TIMEOUT_MS))
 	{
-		rdpudp_fail(udp, "the stream is stuck behind a chunk the server no longer resends");
+		rdpudp_fail(udp, "the stream is stuck behind a chunk the peer no longer resends");
 		return FALSE;
 	}
 
@@ -1885,6 +1920,7 @@ rdpUdp* rdpudp_new(wLog* log, const BYTE* cookieHash, rdpUdpReceiveFn receive, v
 
 	udp->log = log;
 	udp->sockfd = INVALID_SOCKET;
+	udp->ownsSocket = TRUE;
 	udp->state = RDPUDP_STATE_CLOSED;
 	udp->receive = receive;
 	udp->custom = custom;
@@ -1919,7 +1955,7 @@ void rdpudp_free(rdpUdp* udp)
 	if (!udp)
 		return;
 
-	if (udp->sockfd != INVALID_SOCKET)
+	if (udp->ownsSocket && (udp->sockfd != INVALID_SOCKET))
 		closesocket(udp->sockfd);
 
 	for (size_t x = 0; x < RDPUDP_MAX_IN_FLIGHT; x++)
@@ -1979,6 +2015,163 @@ BOOL rdpudp_connect(rdpUdp* udp, const struct sockaddr* addr, size_t addrlen)
 	udp->state = RDPUDP_STATE_SYN_SENT;
 	udp->lastReceived = now_ms();
 	return send_syn(udp);
+}
+
+/* [MS-RDPEUDP] 3.1.5.1.3: the SYN+ACK is a SYN that acknowledges the client's
+ * snInitialSequenceNumber, with the MTU both ends use and the version both support. Like the SYN
+ * it is zero padded to that MTU. It carries no cookieHash. */
+WINPR_ATTR_NODISCARD
+static BOOL build_syn_ack(rdpUdp* udp, UINT32 clientInitial)
+{
+	WINPR_ASSERT(udp);
+	memset(udp->synAck, 0, sizeof(udp->synAck));
+	wStream sbuffer = WINPR_C_ARRAY_INIT;
+	wStream* s = Stream_StaticInit(&sbuffer, udp->synAck, sizeof(udp->synAck));
+
+	/* RDPUDP_FEC_HEADER */
+	Stream_Write_UINT32_BE(s, clientInitial); /* snSourceAck */
+	Stream_Write_UINT16_BE(s, RDPUDP_RECEIVE_WINDOW);
+	Stream_Write_UINT16_BE(s, RDPUDP_FLAG_SYN | RDPUDP_FLAG_ACK | RDPUDP_FLAG_SYNEX);
+
+	/* RDPUDP_SYNDATA_PAYLOAD */
+	Stream_Write_UINT32_BE(s, udp->initialSequence);
+	Stream_Write_UINT16_BE(s, udp->mtu); /* uUpStreamMtu */
+	Stream_Write_UINT16_BE(s, udp->mtu); /* uDownStreamMtu */
+
+	/* RDPUDP_SYNDATAEX_PAYLOAD */
+	Stream_Write_UINT16_BE(s, RDPUDP_VERSION_INFO_VALID);
+	Stream_Write_UINT16_BE(s, udp->version);
+
+	udp->synAckLength = udp->mtu;
+	return TRUE;
+}
+
+BOOL rdpudp_accept(rdpUdp* udp, SOCKET sockfd, const struct sockaddr* addr, size_t addrlen,
+                   const BYTE* syn, size_t length)
+{
+	WINPR_ASSERT(udp);
+	WINPR_ASSERT(addr);
+	WINPR_ASSERT(syn);
+
+	if ((udp->state != RDPUDP_STATE_CLOSED) || (addrlen > sizeof(udp->peerAddr)) ||
+	    !is_syn(syn, length))
+		return FALSE;
+
+	wStream sbuffer = WINPR_C_ARRAY_INIT;
+	wStream* s = Stream_StaticConstInit(&sbuffer, syn, length);
+	if (!Stream_CheckAndLogRequiredLengthWLog(udp->log, s, 16))
+		return FALSE;
+
+	/* RDPUDP_FEC_HEADER */
+	Stream_Seek_UINT32(s); /* snSourceAck: -1 */
+	const UINT16 window = Stream_Get_UINT16_BE(s);
+	const UINT16 flags = Stream_Get_UINT16_BE(s);
+
+	/* RDPUDP_SYNDATA_PAYLOAD */
+	const UINT32 clientInitial = Stream_Get_UINT32_BE(s);
+	const UINT16 upMtu = Stream_Get_UINT16_BE(s);
+	const UINT16 downMtu = Stream_Get_UINT16_BE(s);
+
+	if ((flags & RDPUDP_FLAG_CORRELATION_ID) && !Stream_SafeSeek(s, 32))
+		return FALSE;
+
+	/* RDPUDP_SYNDATAEX_PAYLOAD. The listener matched the cookieHash of a version 3 SYN to this
+	 * connection already: the other versions carry none and cannot be told apart. */
+	UINT16 version = RDPUDP_PROTOCOL_VERSION_1;
+	if ((flags & RDPUDP_FLAG_SYNEX) && (Stream_GetRemainingLength(s) >= 4))
+	{
+		const UINT16 synExFlags = Stream_Get_UINT16_BE(s);
+		const UINT16 udpVersion = Stream_Get_UINT16_BE(s);
+		if (synExFlags & RDPUDP_VERSION_INFO_VALID)
+			version = udpVersion;
+	}
+	if (version != RDPUDP_PROTOCOL_VERSION_3)
+	{
+		WLog_Print(udp->log, WLOG_WARN,
+		           "the client offers RDP-UDP version 0x%04" PRIx16 ", only 0x%04" PRIx16
+		           " is implemented for a server",
+		           version, RDPUDP_PROTOCOL_VERSION_3);
+		return FALSE;
+	}
+
+	/* [MS-RDPEUDP] 3.1.1.3: neither end sends more than the smaller of the two */
+	UINT16 mtu = (upMtu < downMtu) ? upMtu : downMtu;
+	if (mtu > RDPUDP_MTU)
+		mtu = RDPUDP_MTU;
+	if (mtu < RDPUDP_MIN_MTU)
+		mtu = RDPUDP_MIN_MTU;
+
+	udp->server = TRUE;
+	udp->sockfd = sockfd;
+	udp->ownsSocket = FALSE;
+	memcpy(&udp->peerAddr, addr, addrlen);
+	udp->peerAddrLength = addrlen;
+
+	udp->mtu = mtu;
+	udp->version = version;
+	udp->peerWindow = window;
+	udp->lastReceived = now_ms();
+	udp->lastDelivery = udp->lastReceived;
+	udp->state = RDPUDP_STATE_ESTABLISHED;
+
+	/* as on the client, see process_syn_ack */
+	udp->nextCoded = RDPUDP2_INITIAL_SEQUENCE;
+	udp->nextChannelSeq = 1;
+	udp->v3NextChannel = 1;
+	udp->v3MaxDelayedAcks = RDPUDP2_DEFAULT_DELAYED_ACKS;
+	udp->v3DelayedAckTimeout = UINT32_MAX;
+
+	if (!build_syn_ack(udp, clientInitial))
+		return FALSE;
+	WLog_Print(udp->log, WLOG_INFO,
+	           "RDP-UDP client accepted, protocol version 0x%04" PRIx16 ", MTU %" PRIu16, version,
+	           mtu);
+	return rdpudp_send_raw(udp, udp->synAck, udp->synAckLength);
+}
+
+BOOL rdpudp_get_syn_cookie_hash(const BYTE* data, size_t length, BYTE hash[32])
+{
+	WINPR_ASSERT(hash);
+	if (!is_syn(data, length))
+		return FALSE;
+
+	wStream sbuffer = WINPR_C_ARRAY_INIT;
+	wStream* s = Stream_StaticConstInit(&sbuffer, data, length);
+	Stream_Seek(s, 6);
+	const UINT16 flags = Stream_Get_UINT16_BE(s);
+	if (!(flags & RDPUDP_FLAG_SYNEX) || !Stream_SafeSeek(s, 8)) /* RDPUDP_SYNDATA_PAYLOAD */
+		return FALSE;
+	if ((flags & RDPUDP_FLAG_CORRELATION_ID) && !Stream_SafeSeek(s, 32))
+		return FALSE;
+	if (Stream_GetRemainingLength(s) < 4 + 32)
+		return FALSE;
+	const UINT16 synExFlags = Stream_Get_UINT16_BE(s);
+	const UINT16 version = Stream_Get_UINT16_BE(s);
+	if (!(synExFlags & RDPUDP_VERSION_INFO_VALID) || (version != RDPUDP_PROTOCOL_VERSION_3))
+		return FALSE;
+	Stream_Read(s, hash, 32);
+	return TRUE;
+}
+
+BOOL rdpudp_input(rdpUdp* udp, const BYTE* data, size_t length)
+{
+	WINPR_ASSERT(udp);
+	WINPR_ASSERT(data || (length == 0));
+
+	if (udp->state != RDPUDP_STATE_ESTABLISHED)
+		return FALSE;
+	if (!process_datagram(udp, data, length))
+	{
+		rdpudp_fail(udp, "failed to process a datagram");
+		return FALSE;
+	}
+	if (udp->state == RDPUDP_STATE_FAILED)
+		return FALSE;
+	if (!v3_ack_if_due(udp))
+		return FALSE;
+	if (!ack_when_due(udp))
+		return FALSE;
+	return flush_send_queue(udp);
 }
 
 SOCKET rdpudp_get_socket(const rdpUdp* udp)
@@ -2060,7 +2253,7 @@ BOOL rdpudp_check(rdpUdp* udp)
 		return FALSE;
 
 	BYTE* buffer = udp->recvBuffer;
-	while (TRUE)
+	while (udp->ownsSocket)
 	{
 		const int rc = _recv(udp->sockfd, (char*)buffer,
 		                     WINPR_ASSERTING_INT_CAST(int, sizeof(udp->recvBuffer)), 0);

@@ -70,6 +70,10 @@ struct rdp_peer_channel
 
 	char channelName[128];
 	CRITICAL_SECTION writeLock;
+
+	/* Soft-Sync moved this channel onto the reliable UDP tunnel, it is written there from now
+	 * on. Changed under writeLock. */
+	BOOL tunnel;
 };
 
 struct WTSVirtualChannelManager
@@ -89,6 +93,12 @@ struct WTSVirtualChannelManager
 	void* dvc_creation_status_userdata;
 
 	wHashTable* dynamicVirtualChannels;
+
+	/* [MS-RDPEDYC] 3.1.5.3 Soft-Sync, on the thread that runs the connection */
+	BOOL tunnelReady;
+	BOOL softSyncDue; /* a channel opened, Soft-Sync may move it */
+	BYTE softSyncState;
+	wQueue* tunnelBacklog; /* client PDUs from the tunnel before its Soft-Sync Response */
 };
 
 WINPR_ATTR_NODISCARD

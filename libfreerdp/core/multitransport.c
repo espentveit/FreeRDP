@@ -36,6 +36,8 @@
 #include "transport.h"
 #include "rdpemt.h"
 #include "multitransport.h"
+#include "../crypto/certificate.h"
+#include "../crypto/privatekey.h"
 
 typedef enum
 {
@@ -67,6 +69,12 @@ struct rdp_multitransport
 
 	BYTE reliableCookie[RDPUDP_COOKIE_LEN];
 	BYTE reliableCookieHash[RDPUDP_COOKIE_HASHLEN];
+
+	/* [MS-RDPEDYC] 3.1.5.3: the tunnel carries channel data once the client accepted it over
+	 * UDP (Tunnel Create Request) and over TCP (Initiate Multitransport Response), in either
+	 * order. Guarded by lock. */
+	BOOL serverTunnelUp;
+	BOOL serverResponseOk;
 
 	/* client-side data */
 	CRITICAL_SECTION lock;
@@ -169,6 +177,58 @@ static BOOL multitransport_request_send(rdpMultitransport* multi, UINT32 reqId, 
 	return rdp_send_message_channel_pdu(multi->rdp, s, sec_flags | SEC_TRANSPORT_REQ);
 }
 
+static void multitransport_tunnel_event(void* custom, rdpEmt* emt, RDPEMT_EVENT event,
+                                        const BYTE* data, size_t length);
+
+/* Server: the tunnel end for the request about to go out, with the main connection's
+ * certificate and key, which the client checks the tunnel's TLS session against. */
+WINPR_ATTR_NODISCARD
+static BOOL multitransport_server_start_tunnel(rdpMultitransport* multi)
+{
+	WINPR_ASSERT(multi);
+	WINPR_ASSERT(multi->rdp);
+	rdpSettings* settings = multi->rdp->settings;
+	WINPR_ASSERT(settings);
+
+	if (!rdpemt_is_supported())
+		return FALSE;
+
+	rdpCertificate* cert =
+	    freerdp_settings_get_pointer_writable(settings, FreeRDP_RdpServerCertificate);
+	const rdpPrivateKey* key = freerdp_settings_get_pointer(settings, FreeRDP_RdpServerRsaKey);
+	if (!cert || !key)
+	{
+		WLog_INFO(TAG, "not offering UDP, the server has no TLS certificate");
+		return FALSE;
+	}
+
+	EVP_PKEY* evp = freerdp_key_get_evp_pkey(key);
+	if (!evp)
+		return FALSE;
+	rdpEmt* emt = rdpemt_new_server(WLog_Get(TAG), multi->reliableReqId, multi->reliableCookie,
+	                                freerdp_certificate_get_x509(cert), evp,
+	                                multitransport_tunnel_event, multi);
+	EVP_PKEY_free(evp);
+	if (!emt)
+	{
+		WLog_WARN(TAG, "cannot wait for a UDP tunnel, not offering one");
+		return FALSE;
+	}
+
+	EnterCriticalSection(&multi->lock);
+	multi->reliable = emt;
+	multi->reliableState = FREERDP_MULTITRANSPORT_TUNNEL_PENDING;
+	multi->serverTunnelUp = FALSE;
+	multi->serverResponseOk = FALSE;
+	LeaveCriticalSection(&multi->lock);
+	WLog_INFO(TAG, "offering a reliable UDP tunnel, request %" PRIu32, multi->reliableReqId);
+	return TRUE;
+}
+
+/* Server: the tunnel is ready for channel data once both acceptances are in. */
+WINPR_ATTR_NODISCARD
+static BOOL multitransport_server_check_ready(rdpMultitransport* multi);
+
 state_run_t multitransport_server_request(rdpMultitransport* multi, UINT16 reqProto)
 {
 	WINPR_ASSERT(multi);
@@ -181,6 +241,11 @@ state_run_t multitransport_server_request(rdpMultitransport* multi, UINT16 reqPr
 		multi->reliableReqId = reqId++;
 		if (winpr_RAND(multi->reliableCookie, sizeof(multi->reliableCookie)) < 0)
 			return STATE_RUN_FAILED;
+
+		/* The tunnel waits on the UDP listener for the client that brings this cookie. Without
+		 * it the request is not sent, and the connection carries on over TCP. */
+		if (!multitransport_server_start_tunnel(multi))
+			return STATE_RUN_CONTINUE;
 
 		return multitransport_request_send(multi, multi->reliableReqId, reqProto,
 		                                   multi->reliableCookie)
@@ -525,6 +590,16 @@ static BOOL multitransport_handle_event(rdpMultitransport* multi, const mt_event
 	WINPR_ASSERT(multi);
 	WINPR_ASSERT(ev);
 
+	const BOOL server = freerdp_settings_get_bool(multi->rdp->settings, FreeRDP_ServerMode);
+	if (server && (ev->type == MT_EVENT_READY))
+	{
+		EnterCriticalSection(&multi->lock);
+		if (multi->reliable)
+			multi->serverTunnelUp = TRUE;
+		LeaveCriticalSection(&multi->lock);
+		return multitransport_server_check_ready(multi);
+	}
+
 	switch (ev->type)
 	{
 		case MT_EVENT_READY:
@@ -580,7 +655,7 @@ static BOOL multitransport_handle_event(rdpMultitransport* multi, const mt_event
 				                              FREERDP_ERROR_CONNECT_TRANSPORT_FAILED);
 				return FALSE;
 			}
-			if (!responseSent)
+			if (!responseSent && !server)
 			{
 				if (!multitransport_client_send_response(multi, reqId, E_ABORT))
 					return FALSE;
@@ -676,13 +751,50 @@ void multitransport_reset(rdpMultitransport* multi)
 		(void)ResetEvent(multi->event);
 }
 
+static BOOL multitransport_server_check_ready(rdpMultitransport* multi)
+{
+	WINPR_ASSERT(multi);
+
+	EnterCriticalSection(&multi->lock);
+	const BOOL ready = multi->reliable && multi->serverTunnelUp && multi->serverResponseOk &&
+	                   (multi->reliableState != FREERDP_MULTITRANSPORT_TUNNEL_READY);
+	if (ready)
+		multi->reliableState = FREERDP_MULTITRANSPORT_TUNNEL_READY;
+	LeaveCriticalSection(&multi->lock);
+
+	if (!ready)
+		return TRUE;
+	WLog_INFO(TAG, "the client accepted the reliable UDP tunnel");
+	return multitransport_notify_state(multi, FREERDP_MULTITRANSPORT_TUNNEL_READY);
+}
+
 WINPR_ATTR_NODISCARD
-static state_run_t multitransport_server_handle_response(rdpMultitransport* multi,
-                                                         WINPR_ATTR_UNUSED UINT32 reqId,
-                                                         WINPR_ATTR_UNUSED UINT32 hrResponse)
+static state_run_t multitransport_server_handle_response(rdpMultitransport* multi, UINT32 reqId,
+                                                         UINT32 hrResponse)
 {
 	WINPR_ASSERT(multi);
 	rdpRdp* rdp = multi->rdp;
+
+	EnterCriticalSection(&multi->lock);
+	rdpEmt* emt = multi->reliable;
+	const BOOL ours = emt && (reqId == multi->reliableReqId);
+	const BOOL ok = ours && SUCCEEDED((HRESULT)hrResponse);
+	if (ok)
+		multi->serverResponseOk = TRUE;
+	else if (ours)
+	{
+		multi->reliable = nullptr;
+		multi->reliableState = FREERDP_MULTITRANSPORT_TUNNEL_NONE;
+	}
+	LeaveCriticalSection(&multi->lock);
+
+	if (ours && !ok)
+	{
+		WLog_INFO(TAG, "the client declined the UDP tunnel, hrResponse 0x%08" PRIx32, hrResponse);
+		rdpemt_free(emt);
+	}
+	if (ok && !multitransport_server_check_ready(multi))
+		return STATE_RUN_FAILED;
 
 	if (!rdp_server_transition_to_state(rdp, CONNECTION_STATE_CAPABILITIES_EXCHANGE_DEMAND_ACTIVE))
 		return STATE_RUN_FAILED;

@@ -310,7 +310,13 @@ static DWORD freerdp_peer_get_event_handles(freerdp_peer* client, HANDLE* events
 	WINPR_ASSERT(client);
 	WINPR_ASSERT(client->context);
 	WINPR_ASSERT(client->context->rdp);
-	return transport_get_event_handles(client->context->rdp->transport, events, count);
+	const DWORD nCount = transport_get_event_handles(client->context->rdp->transport, events, count);
+	if ((nCount == 0) || (nCount >= count))
+		return nCount;
+
+	/* tunnel events, from the client's UDP datagrams, are handled in freerdp_peer_check_fds */
+	events[nCount] = multitransport_get_event_handle(client->context->rdp->multitransport);
+	return nCount + 1;
 }
 
 static BOOL freerdp_peer_check_fds(freerdp_peer* peer)

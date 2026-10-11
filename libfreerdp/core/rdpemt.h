@@ -70,6 +70,18 @@ FREERDP_LOCAL rdpEmt* rdpemt_new(wLog* log, UINT32 requestId, const BYTE* cookie
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL rdpemt_start(rdpEmt* emt, const struct sockaddr* addr, size_t addrlen);
 
+/** @brief The server end of a reliable tunnel, for one Initiate Multitransport Request.
+ *
+ * It waits for the client whose SYN carries the hash of cookie, on the UDP listener, runs TLS
+ * with cert and key (those of the main connection) and accepts a Tunnel Create Request that
+ * names requestId and cookie. RDPEMT_EVENT_READY follows the Tunnel Create Response.
+ */
+WINPR_ATTR_MALLOC(rdpemt_free, 1)
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL rdpEmt* rdpemt_new_server(wLog* log, UINT32 requestId, const BYTE* cookie,
+                                        struct x509_st* cert, struct evp_pkey_st* key,
+                                        rdpEmtEventFn callback, void* custom);
+
 /** Sends one Tunnel Data PDU. Thread safe. */
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL rdpemt_send_data(rdpEmt* emt, const BYTE* data, size_t length);
@@ -101,6 +113,18 @@ rdpemt_new(WINPR_ATTR_UNUSED wLog* log, WINPR_ATTR_UNUSED UINT32 requestId,
            WINPR_ATTR_UNUSED const BYTE* cookie, WINPR_ATTR_UNUSED const char* hostname,
            WINPR_ATTR_UNUSED const BYTE* publicKey, WINPR_ATTR_UNUSED size_t publicKeyLength,
            WINPR_ATTR_UNUSED rdpEmtEventFn callback, WINPR_ATTR_UNUSED void* custom)
+{
+	return nullptr;
+}
+
+WINPR_ATTR_NODISCARD
+static inline rdpEmt* rdpemt_new_server(WINPR_ATTR_UNUSED wLog* log,
+                                        WINPR_ATTR_UNUSED UINT32 requestId,
+                                        WINPR_ATTR_UNUSED const BYTE* cookie,
+                                        WINPR_ATTR_UNUSED struct x509_st* cert,
+                                        WINPR_ATTR_UNUSED struct evp_pkey_st* key,
+                                        WINPR_ATTR_UNUSED rdpEmtEventFn callback,
+                                        WINPR_ATTR_UNUSED void* custom)
 {
 	return nullptr;
 }

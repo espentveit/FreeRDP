@@ -30,6 +30,7 @@
 #include <winpr/assert.h>
 #include <winpr/ssl.h>
 #include <winpr/synch.h>
+#include <winpr/sysinfo.h>
 #include <winpr/file.h>
 #include <winpr/string.h>
 #include <winpr/path.h>
@@ -100,6 +101,13 @@ static void test_peer_context_free(freerdp_peer* client, rdpContext* ctx)
 			(void)WTSVirtualChannelClose(context->debug_channel);
 
 		sf_peer_audin_uninit(context);
+
+		if (context->echo)
+		{
+			if (context->echo->Close(context->echo) != CHANNEL_RC_OK)
+				WLog_WARN(TAG, "closing the echo channel failed");
+			echo_server_context_free(context->echo);
+		}
 
 #if defined(CHANNEL_AINPUT_SERVER)
 		sf_peer_ainput_uninit(context);
@@ -685,6 +693,53 @@ fail:
 }
 
 WINPR_ATTR_NODISCARD
+static UINT sf_peer_echo_open_result(echo_server_context* echo, ECHO_SERVER_OPEN_RESULT result)
+{
+	WINPR_ASSERT(echo);
+	testPeerContext* context = echo->data;
+	WINPR_ASSERT(context);
+	context->echo_open = (result == ECHO_SERVER_OPEN_RESULT_OK);
+	WLog_INFO(TAG, "echo channel %s", context->echo_open ? "open" : "not available");
+	return CHANNEL_RC_OK;
+}
+
+static UINT sf_peer_echo_response(echo_server_context* echo, const BYTE* buffer, UINT32 length)
+{
+	WINPR_ASSERT(echo);
+	UINT64 sent = 0;
+	if (length == sizeof(sent))
+	{
+		memcpy(&sent, buffer, sizeof(sent));
+		WLog_INFO(TAG, "echo round trip %" PRIu64 " ms", GetTickCount64() - sent);
+	}
+	return CHANNEL_RC_OK;
+}
+
+static void sf_peer_echo(testPeerContext* context)
+{
+	WINPR_ASSERT(context);
+
+	if (!context->echo)
+	{
+		context->echo = echo_server_context_new(context->vcm);
+		if (!context->echo)
+			return;
+		context->echo->data = context;
+		context->echo->OpenResult = sf_peer_echo_open_result;
+		context->echo->Response = sf_peer_echo_response;
+		if (context->echo->Open(context->echo) != CHANNEL_RC_OK)
+			WLog_WARN(TAG, "cannot open the echo channel");
+		return;
+	}
+
+	const UINT64 now = GetTickCount64();
+	if (!context->echo_open || (now - context->echo_sent < 1000))
+		return;
+	context->echo_sent = now;
+	if (!context->echo->Request(context->echo, (const BYTE*)&now, sizeof(now)))
+		WLog_WARN(TAG, "echo request failed");
+}
+
 static BOOL tf_peer_post_connect(freerdp_peer* client)
 {
 	testPeerContext* context = nullptr;
@@ -1199,6 +1254,12 @@ static DWORD WINAPI test_peer_mainloop(LPVOID arg)
 	if (!freerdp_settings_set_bool(settings, FreeRDP_HasRelativeMouseEvent, TRUE))
 		goto fail;
 
+	/* UDP multitransport: a reliable tunnel, onto which Soft-Sync moves the dynamic channels */
+	if (!freerdp_settings_set_bool(settings, FreeRDP_SupportMultitransport, TRUE) ||
+	    !freerdp_settings_set_uint32(settings, FreeRDP_MultitransportFlags,
+	                                 TRANSPORT_TYPE_UDP_FECR | SOFTSYNC_TCP_TO_UDP))
+		goto fail;
+
 	client->PostConnect = tf_peer_post_connect;
 	client->Activate = tf_peer_activate;
 
@@ -1263,7 +1324,7 @@ static DWORD WINAPI test_peer_mainloop(LPVOID arg)
 
 		HANDLE channelHandle = WTSVirtualChannelManagerGetEventHandle(context->vcm);
 		handles[count++] = channelHandle;
-		status = WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+		status = WaitForMultipleObjects(count, handles, FALSE, 1000);
 
 		if (status == WAIT_FAILED)
 		{
@@ -1312,6 +1373,7 @@ static DWORD WINAPI test_peer_mainloop(LPVOID arg)
 					}
 #endif
 
+					sf_peer_echo(context);
 					break;
 
 				case DRDYNVC_STATE_FAILED:

@@ -46,6 +46,7 @@
 
 #include "../crypto/certificate.h"
 #include "rdpudp.h"
+#include "udplistener.h"
 #include "rdpemt.h"
 
 /* [MS-RDPEMT] 2.2.1.1 RDP_TUNNEL_HEADER Action */
@@ -82,6 +83,13 @@ struct rdp_emt
 
 	rdpEmtEventFn callback;
 	void* custom;
+
+	/* server side: the certificate and key of the main connection, and the hash of the cookie
+	 * that the client's SYN carries */
+	BOOL server;
+	X509* cert;
+	EVP_PKEY* key;
+	BYTE cookieHash[32];
 
 	rdpUdp* udp;
 	SSL_CTX* ctx;
@@ -335,6 +343,52 @@ static BOOL emt_process_subheaders(rdpEmt* emt, const BYTE* data, size_t length)
 	return TRUE;
 }
 
+/* Server: [MS-RDPEMT] 2.2.2.1 RDP_TUNNEL_CREATEREQUEST, answered with 2.2.2.2
+ * RDP_TUNNEL_CREATERESPONSE. The request id and cookie are those of the Initiate Multitransport
+ * Request this tunnel is for. */
+WINPR_ATTR_NODISCARD
+static BOOL emt_accept_create_request(rdpEmt* emt, wStream* s, size_t payloadLength)
+{
+	WINPR_ASSERT(emt);
+	WINPR_ASSERT(s);
+
+	if (payloadLength < 24)
+	{
+		emt_fail(emt, "short Tunnel Create Request");
+		return FALSE;
+	}
+	const UINT32 requestId = Stream_Get_UINT32(s); /* RequestID */
+	Stream_Seek_UINT32(s);                         /* Reserved */
+	const BYTE* cookie = Stream_ConstPointer(s);   /* SecurityCookie */
+	Stream_Seek(s, payloadLength - 8);
+
+	const BOOL valid =
+	    (requestId == emt->requestId) && (memcmp(cookie, emt->cookie, sizeof(emt->cookie)) == 0);
+	BYTE response[4] = WINPR_C_ARRAY_INIT;
+	wStream rbuffer = WINPR_C_ARRAY_INIT;
+	wStream* rs = Stream_StaticInit(&rbuffer, response, sizeof(response));
+	Stream_Write_UINT32(rs, valid ? (UINT32)S_OK : (UINT32)E_ABORT); /* HrResponse */
+	if (!emt_write_pdu(emt, RDPTUNNEL_ACTION_CREATERESPONSE, nullptr, 0, response,
+	                   sizeof(response)))
+	{
+		emt_fail(emt, "failed to send the Tunnel Create Response");
+		return FALSE;
+	}
+	if (!valid)
+	{
+		emt_fail(emt, "the Tunnel Create Request names another request or cookie");
+		return FALSE;
+	}
+	if (!emt->ready)
+	{
+		WLog_Print(emt->log, WLOG_INFO, "UDP multitransport tunnel ready (RDP-UDP version 0x%04" PRIx16 ")",
+		           rdpudp_get_version(emt->udp));
+		emt->ready = TRUE;
+		emt->callback(emt->custom, emt, RDPEMT_EVENT_READY, nullptr, 0);
+	}
+	return TRUE;
+}
+
 WINPR_ATTR_NODISCARD
 static BOOL emt_process_pdus(rdpEmt* emt)
 {
@@ -405,6 +459,16 @@ static BOOL emt_process_pdus(rdpEmt* emt)
 			}
 			break;
 
+			case RDPTUNNEL_ACTION_CREATEREQUEST:
+				if (!emt->server)
+				{
+					Stream_Seek(s, payloadLength);
+					break;
+				}
+				if (!emt_accept_create_request(emt, s, payloadLength))
+					return FALSE;
+				break;
+
 			case RDPTUNNEL_ACTION_DATA:
 				/* [MS-RDPEMT] 2.2.2.3 RDP_TUNNEL_DATA, HigherLayerData is a DVC PDU */
 				if (payloadLength > 0)
@@ -450,15 +514,19 @@ static BOOL emt_run_tls(rdpEmt* emt)
 		emt->handshakeDone = TRUE;
 		WLog_Print(emt->log, WLOG_DEBUG, "tunnel TLS session established (%s, %s)",
 		           SSL_get_version(emt->ssl), SSL_get_cipher_name(emt->ssl));
-		if (!emt_verify_peer(emt))
+		/* the server waits for the client's Tunnel Create Request */
+		if (!emt->server)
 		{
-			emt_fail(emt, "certificate mismatch");
-			return FALSE;
-		}
-		if (!emt_send_create_request(emt))
-		{
-			emt_fail(emt, "failed to send the Tunnel Create Request");
-			return FALSE;
+			if (!emt_verify_peer(emt))
+			{
+				emt_fail(emt, "certificate mismatch");
+				return FALSE;
+			}
+			if (!emt_send_create_request(emt))
+			{
+				emt_fail(emt, "failed to send the Tunnel Create Request");
+				return FALSE;
+			}
 		}
 	}
 
@@ -479,7 +547,7 @@ static BOOL emt_run_tls(rdpEmt* emt)
 		if (err == SSL_ERROR_WANT_READ)
 			break;
 		log_ssl_errors(emt, "SSL_read");
-		emt_fail(emt, (err == SSL_ERROR_ZERO_RETURN) ? "the server closed the tunnel"
+		emt_fail(emt, (err == SSL_ERROR_ZERO_RETURN) ? "the peer closed the tunnel"
 		                                             : "TLS error inside the tunnel");
 		return FALSE;
 	}
@@ -513,9 +581,17 @@ static BOOL emt_start_tls(rdpEmt* emt)
 {
 	WINPR_ASSERT(emt);
 
-	emt->ctx = SSL_CTX_new(TLS_client_method());
+	emt->ctx = SSL_CTX_new(emt->server ? TLS_server_method() : TLS_client_method());
 	if (!emt->ctx)
 		return FALSE;
+
+	/* the server presents the main connection's certificate, which the client checks for */
+	if (emt->server && ((SSL_CTX_use_certificate(emt->ctx, emt->cert) != 1) ||
+	                    (SSL_CTX_use_PrivateKey(emt->ctx, emt->key) != 1)))
+	{
+		WLog_Print(emt->log, WLOG_ERROR, "cannot use the server certificate for the tunnel");
+		return FALSE;
+	}
 
 	if (!SSL_CTX_set_min_proto_version(emt->ctx, TLS1_2_VERSION))
 	{
@@ -572,9 +648,14 @@ static BOOL emt_start_tls(rdpEmt* emt)
 		return FALSE;
 	}
 	SSL_set_bio(emt->ssl, emt->rbio, emt->wbio);
-	SSL_set_connect_state(emt->ssl);
-	if (emt->hostname)
-		(void)SSL_set_tlsext_host_name(emt->ssl, emt->hostname);
+	if (emt->server)
+		SSL_set_accept_state(emt->ssl);
+	else
+	{
+		SSL_set_connect_state(emt->ssl);
+		if (emt->hostname)
+			(void)SSL_set_tlsext_host_name(emt->ssl, emt->hostname);
+	}
 
 	/* every record fits in one datagram */
 	const size_t max = rdpudp_get_max_payload(emt->udp);
@@ -599,6 +680,16 @@ static BOOL emt_poll(rdpEmt* emt)
 
 	if (emt->failed)
 		return FALSE;
+
+	if (emt->server && (rdpudp_get_state(emt->udp) == RDPUDP_STATE_CLOSED))
+	{
+		if (GetTickCount64() - emt->started > RDPEMT_SETUP_TIMEOUT_MS)
+		{
+			emt_fail(emt, "no SYN from the client");
+			return FALSE;
+		}
+		return TRUE;
+	}
 
 	if (!rdpudp_check(emt->udp))
 	{
@@ -679,7 +770,11 @@ static DWORD WINAPI emt_thread(LPVOID arg)
 		const SOCKET sockfd = rdpudp_get_socket(emt->udp);
 		LeaveCriticalSection(&emt->lock);
 
-		emt_wait_readable(sockfd, timeout);
+		/* a server connection shares the listener's socket, the listener reads it */
+		if (emt->server)
+			Sleep(timeout);
+		else
+			emt_wait_readable(sockfd, timeout);
 
 		if (emt_stopping(emt))
 			break;
@@ -693,6 +788,27 @@ static DWORD WINAPI emt_thread(LPVOID arg)
 
 	ExitThread(0);
 	return 0;
+}
+
+/* [MS-RDPEUDP] 2.2.2.9: cookieHash is the SHA-256 hash of the securityCookie. It is sent with
+ * each 32 bit word byte swapped, which is what Windows accepts. */
+WINPR_ATTR_NODISCARD
+static BOOL emt_cookie_hash(const BYTE cookie[16], BYTE cookieHash[32])
+{
+	BYTE digest[32] = WINPR_C_ARRAY_INIT;
+	if (!winpr_Digest(WINPR_MD_SHA256, cookie, 16, digest, sizeof(digest)))
+		return FALSE;
+	wStream dbuffer = WINPR_C_ARRAY_INIT;
+	wStream hbuffer = WINPR_C_ARRAY_INIT;
+	wStream* ds = Stream_StaticConstInit(&dbuffer, digest, sizeof(digest));
+	wStream* hs = Stream_StaticInit(&hbuffer, cookieHash, 32);
+	for (size_t x = 0; x < 32 / 4; x++)
+	{
+		/* the Stream_Write macros evaluate their value more than once */
+		const UINT32 word = Stream_Get_UINT32_BE(ds);
+		Stream_Write_UINT32(hs, word);
+	}
+	return TRUE;
 }
 
 rdpEmt* rdpemt_new(wLog* log, UINT32 requestId, const BYTE* cookie, const char* hostname,
@@ -732,34 +848,113 @@ rdpEmt* rdpemt_new(wLog* log, UINT32 requestId, const BYTE* cookie, const char* 
 	memcpy(emt->publicKey, publicKey, publicKeyLength);
 	emt->publicKeyLength = publicKeyLength;
 
-	/* [MS-RDPEUDP] 2.2.2.9: cookieHash is the SHA-256 hash of the securityCookie. It is sent
-	 * with each 32 bit word byte swapped, which is what Windows accepts. */
-	BYTE digest[32] = WINPR_C_ARRAY_INIT;
-	if (!winpr_Digest(WINPR_MD_SHA256, emt->cookie, sizeof(emt->cookie), digest, sizeof(digest)))
+	if (!emt_cookie_hash(emt->cookie, emt->cookieHash))
 		goto fail;
-	BYTE cookieHash[32] = WINPR_C_ARRAY_INIT;
-	{
-		wStream dbuffer = WINPR_C_ARRAY_INIT;
-		wStream hbuffer = WINPR_C_ARRAY_INIT;
-		wStream* ds = Stream_StaticConstInit(&dbuffer, digest, sizeof(digest));
-		wStream* hs = Stream_StaticInit(&hbuffer, cookieHash, sizeof(cookieHash));
-		for (size_t x = 0; x < sizeof(cookieHash) / 4; x++)
-		{
-			/* the Stream_Write macros evaluate their value more than once */
-			const UINT32 word = Stream_Get_UINT32_BE(ds);
-			Stream_Write_UINT32(hs, word);
-		}
-	}
 
 	emt->in = Stream_New(nullptr, 16384);
 	emt->out = Stream_New(nullptr, 4096);
 	if (!emt->in || !emt->out)
 		goto fail;
 
-	emt->udp = rdpudp_new(log, cookieHash, emt_receive, emt);
+	emt->udp = rdpudp_new(log, emt->cookieHash, emt_receive, emt);
 	if (!emt->udp)
 		goto fail;
 
+	return emt;
+fail:
+	WINPR_PRAGMA_DIAG_PUSH
+	WINPR_PRAGMA_DIAG_IGNORED_MISMATCHED_DEALLOC
+	rdpemt_free(emt);
+	WINPR_PRAGMA_DIAG_POP
+	return nullptr;
+}
+
+/* Runs on the listener's thread. */
+WINPR_ATTR_NODISCARD
+static BOOL emt_server_input(void* custom, SOCKET sockfd, const struct sockaddr* addr,
+                             size_t addrlen, const BYTE* data, size_t length)
+{
+	rdpEmt* emt = custom;
+	WINPR_ASSERT(emt);
+
+	EnterCriticalSection(&emt->lock);
+	BOOL rc = !emt->failed;
+	if (rc)
+	{
+		if (rdpudp_get_state(emt->udp) == RDPUDP_STATE_CLOSED)
+		{
+			rc = rdpudp_accept(emt->udp, sockfd, addr, addrlen, data, length);
+			if (!rc)
+				emt_fail(emt, "cannot accept the client's SYN");
+		}
+		else if (!rdpudp_input(emt->udp, data, length))
+		{
+			emt_fail(emt, "the RDP-UDP connection failed");
+			rc = FALSE;
+		}
+	}
+	if (rc && !emt->tlsStarted && (rdpudp_get_state(emt->udp) == RDPUDP_STATE_ESTABLISHED))
+	{
+		rc = emt_start_tls(emt);
+		if (!rc)
+		{
+			log_ssl_errors(emt, "TLS setup");
+			emt_fail(emt, "failed to start TLS");
+		}
+	}
+	LeaveCriticalSection(&emt->lock);
+	return rc;
+}
+
+rdpEmt* rdpemt_new_server(wLog* log, UINT32 requestId, const BYTE* cookie, X509* cert,
+                          EVP_PKEY* key, rdpEmtEventFn callback, void* custom)
+{
+	WINPR_ASSERT(log);
+	WINPR_ASSERT(cookie);
+	WINPR_ASSERT(cert);
+	WINPR_ASSERT(key);
+	WINPR_ASSERT(callback);
+
+	rdpEmt* emt = calloc(1, sizeof(rdpEmt));
+	if (!emt)
+		return nullptr;
+
+	emt->log = log;
+	emt->server = TRUE;
+	emt->requestId = requestId;
+	memcpy(emt->cookie, cookie, sizeof(emt->cookie));
+	emt->callback = callback;
+	emt->custom = custom;
+	if (!InitializeCriticalSectionAndSpinCount(&emt->lock, 4000))
+	{
+		free(emt);
+		return nullptr;
+	}
+
+	if ((X509_up_ref(cert) != 1) || (EVP_PKEY_up_ref(key) != 1))
+		goto fail;
+	emt->cert = cert;
+	emt->key = key;
+
+	if (!emt_cookie_hash(emt->cookie, emt->cookieHash))
+		goto fail;
+
+	emt->in = Stream_New(nullptr, 16384);
+	emt->out = Stream_New(nullptr, 4096);
+	if (!emt->in || !emt->out)
+		goto fail;
+
+	emt->udp = rdpudp_new(log, nullptr, emt_receive, emt);
+	if (!emt->udp)
+		goto fail;
+
+	emt->started = GetTickCount64();
+	if (!udplistener_register(emt->cookieHash, emt_server_input, emt))
+		goto fail;
+
+	emt->thread = CreateThread(nullptr, 0, emt_thread, emt, 0, nullptr);
+	if (!emt->thread)
+		goto fail;
 	return emt;
 fail:
 	WINPR_PRAGMA_DIAG_PUSH
@@ -787,6 +982,10 @@ void rdpemt_free(rdpEmt* emt)
 	if (!emt)
 		return;
 
+	/* no more datagrams from the listener */
+	if (emt->server)
+		udplistener_unregister(emt);
+
 	/* not InterlockedExchange: WinPR's reads the old value non-atomically */
 	InterlockedIncrement(&emt->stop);
 	if (emt->thread)
@@ -797,6 +996,8 @@ void rdpemt_free(rdpEmt* emt)
 
 	SSL_free(emt->ssl); /* frees both BIOs */
 	SSL_CTX_free(emt->ctx);
+	X509_free(emt->cert);
+	EVP_PKEY_free(emt->key);
 	rdpudp_free(emt->udp);
 	free(emt->hostname);
 	free(emt->publicKey);
