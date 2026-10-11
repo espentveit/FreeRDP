@@ -194,6 +194,7 @@ typedef struct
 	UINT64 due;
 	UINT32 rto;
 	UINT32 retransmits;
+	UINT32 timeouts; /* resends because the timer ran out, the only ones the limit counts */
 	BOOL lost; /* an ACK vector reported it missing, it goes out again without waiting for due */
 } rdpudp_pending;
 
@@ -230,6 +231,8 @@ struct rdp_udp
 	UINT64 lastSent;
 	UINT64 lastReceived;
 	UINT32 srtt;
+	UINT32 rttvar;   /* [RFC6298] round trip variation, in ms */
+	BOOL rttSampled; /* srtt and rttvar hold at least one sample */
 
 	/* sending side */
 	rdpudp_pending pending[RDPUDP_MAX_IN_FLIGHT];
@@ -359,8 +362,7 @@ static UINT64 now_ms(void)
 
 /* [MS-RDPEUDP] 3.1.6.1 sets 500 ms for version 1 and 300 ms for version 2. [MS-RDPEUDP2]
  * 3.1.1.2.3 only wants the loss timeout above the delayed ACK time (20 ms, sent in DelayAckInfo);
- * 100 ms leaves room for receivers that batch their ACKs, such as mstsc (up to ~70 ms), and a
- * lost frame tail no longer stalls the video for 300 ms. */
+ * version 3 uses 100 ms until the first round trip sample, then rto_initial follows the samples. */
 WINPR_ATTR_NODISCARD
 static UINT32 rto_floor(const rdpUdp* udp)
 {
@@ -376,13 +378,30 @@ static UINT32 rto_floor(const rdpUdp* udp)
 	}
 }
 
+/* Version 3: the smoothed round trip plus four times its variation ([RFC6298] 2.3), the
+ * variation term at least this much. mstsc and Windows resend after about the round trip plus
+ * 80-90 ms on a LAN, and the margin grows with the round trip; the floor also covers receivers
+ * that hold their ACKs, mstsc up to ~70 ms. */
+#define RDPUDP2_RTO_MIN_VARIATION_MS 80
+
 WINPR_ATTR_NODISCARD
 static UINT32 rto_initial(const rdpUdp* udp)
 {
 	WINPR_ASSERT(udp);
-	const UINT32 floor = rto_floor(udp);
-	const UINT64 rtt2 = (UINT64)udp->srtt * 2ull;
-	const UINT64 rto = (rtt2 > floor) ? rtt2 : floor;
+	UINT64 rto = 0;
+	if ((udp->version == RDPUDP_PROTOCOL_VERSION_3) && udp->rttSampled)
+	{
+		const UINT64 variation = 4ull * udp->rttvar;
+		const UINT64 margin =
+		    (variation > RDPUDP2_RTO_MIN_VARIATION_MS) ? variation : RDPUDP2_RTO_MIN_VARIATION_MS;
+		rto = udp->srtt + margin;
+	}
+	else
+	{
+		const UINT32 floor = rto_floor(udp);
+		const UINT64 rtt2 = (UINT64)udp->srtt * 2ull;
+		rto = (rtt2 > floor) ? rtt2 : floor;
+	}
 	return (rto > RDPUDP_MAX_RTO_MS) ? RDPUDP_MAX_RTO_MS : WINPR_ASSERTING_INT_CAST(UINT32, rto);
 }
 
@@ -1047,6 +1066,7 @@ static BOOL send_chunk_now(rdpUdp* udp, BYTE* data, size_t length)
 	p->rto = rto_initial(udp);
 	p->due = now + p->rto;
 	p->retransmits = 0;
+	p->timeouts = 0;
 	udp->inFlight++;
 
 	return rdpudp_transmit(udp, p);
@@ -1124,9 +1144,18 @@ static void sample_rtt(rdpUdp* udp, const rdpudp_pending* p)
 	const UINT64 sample64 = now_ms() - p->sent;
 	const UINT32 sample =
 	    (sample64 > UINT32_MAX) ? UINT32_MAX : WINPR_ASSERTING_INT_CAST(UINT32, sample64);
-	udp->srtt = (udp->srtt == 0)
-	                ? sample
-	                : WINPR_ASSERTING_INT_CAST(UINT32, ((UINT64)udp->srtt * 7 + sample) / 8);
+	if (!udp->rttSampled)
+	{
+		/* [RFC6298] 2.2 */
+		udp->srtt = sample;
+		udp->rttvar = sample / 2;
+		udp->rttSampled = TRUE;
+		return;
+	}
+	/* [RFC6298] 2.3, the variation first, from the previous smoothed value */
+	const UINT32 delta = (udp->srtt > sample) ? udp->srtt - sample : sample - udp->srtt;
+	udp->rttvar = WINPR_ASSERTING_INT_CAST(UINT32, ((UINT64)udp->rttvar * 3 + delta) / 4);
+	udp->srtt = WINPR_ASSERTING_INT_CAST(UINT32, ((UINT64)udp->srtt * 7 + sample) / 8);
 }
 
 static void cc_on_ack(rdpUdp* udp)
@@ -1972,23 +2001,26 @@ static BOOL run_timers(rdpUdp* udp)
 		rdpudp_pending* p = &udp->pending[x];
 		if (!p->used || ((now < p->due) && !p->lost))
 			continue;
-		if (p->retransmits >= (v3 ? RDPUDP2_MAX_RETRANSMITS : RDPUDP_MAX_RETRANSMITS))
-		{
-			rdpudp_fail(udp, "a datagram went unacknowledged too many times");
-			return FALSE;
-		}
-		p->retransmits++;
 		if (p->lost)
 		{
-			/* reported missing: out again at once, the timer keeps its length */
+			/* reported missing: out again at once, the timer keeps its length. Reordering
+			 * can report a packet missing again and again, so this does not count towards
+			 * the limit; the peer timeout and the stall check bound a dead connection. */
 			p->lost = FALSE;
 		}
 		else
 		{
+			if (p->timeouts >= (v3 ? RDPUDP2_MAX_RETRANSMITS : RDPUDP_MAX_RETRANSMITS))
+			{
+				rdpudp_fail(udp, "a datagram went unacknowledged too many times");
+				return FALSE;
+			}
+			p->timeouts++;
 			p->rto = (p->rto * 2 > RDPUDP_MAX_RTO_MS) ? RDPUDP_MAX_RTO_MS : p->rto * 2;
 			if (v3)
 				cc_on_loss(udp, TRUE);
 		}
+		p->retransmits++;
 		p->due = now + p->rto;
 		if (udp->version == RDPUDP_PROTOCOL_VERSION_3)
 		{
