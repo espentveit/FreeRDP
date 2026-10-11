@@ -1275,7 +1275,9 @@ static DWORD WINAPI test_peer_mainloop(LPVOID arg)
 		if (client->CheckFileDescriptor(client) != TRUE)
 			break;
 
-		if (WTSVirtualChannelManagerCheckFileDescriptor(context->vcm) != TRUE)
+		/* drdynvc opens once, so not before the client joined its channels: like the shadow
+		 * server, wait for the activation */
+		if (WTSVirtualChannelManagerCheckFileDescriptorEx(context->vcm, context->activated) != TRUE)
 			break;
 
 		/* Handle dynamic virtual channel initializations */
