@@ -857,11 +857,12 @@ static BOOL acknowledgements_survive_sequence_wraparound(void)
 	TestCtx ctx = { 0 };
 	CHECK(ctx_connect(&ctx));
 
-	/* send and acknowledge until the next data sequence is 0xFFFE */
+	/* send and acknowledge until the next data sequence is 0xFFFE, in batches no larger than
+	 * the initial congestion window of 32 datagrams: more wait for an acknowledgement */
 	UINT16 next = FIRST_SEQUENCE;
 	while (next != 0xFFFE)
 	{
-		const size_t batch = ((size_t)(0xFFFE - next) > 64) ? 64 : (size_t)(0xFFFE - next);
+		const size_t batch = ((size_t)(0xFFFE - next) > 32) ? 32 : (size_t)(0xFFFE - next);
 		for (size_t x = 0; x < batch; x++)
 			CHECK(rdpudp_send(ctx.udp, (const BYTE*)".", 1));
 		CHECK(collect_data(&ctx, batch, 1000));
