@@ -28,6 +28,7 @@
 #include <winpr/crt.h>
 #include <winpr/cast.h>
 #include <winpr/assert.h>
+#include <winpr/interlocked.h>
 #include <winpr/ssl.h>
 #include <winpr/synch.h>
 #include <winpr/sysinfo.h>
@@ -698,8 +699,11 @@ static UINT sf_peer_echo_open_result(echo_server_context* echo, ECHO_SERVER_OPEN
 	WINPR_ASSERT(echo);
 	testPeerContext* context = echo->data;
 	WINPR_ASSERT(context);
-	context->echo_open = (result == ECHO_SERVER_OPEN_RESULT_OK);
-	WLog_INFO(TAG, "echo channel %s", context->echo_open ? "open" : "not available");
+	const BOOL open = (result == ECHO_SERVER_OPEN_RESULT_OK);
+	/* not InterlockedExchange: WinPR's reads the old value non-atomically */
+	if (open)
+		InterlockedIncrement(&context->echo_open);
+	WLog_INFO(TAG, "echo channel %s", open ? "open" : "not available");
 	return CHANNEL_RC_OK;
 }
 
@@ -735,7 +739,8 @@ static void sf_peer_echo(testPeerContext* context)
 	}
 
 	const UINT64 now = GetTickCount64();
-	if (!context->echo_open || (now - context->echo_sent < 1000))
+	if ((InterlockedCompareExchange(&context->echo_open, 0, 0) == 0) ||
+	    (now - context->echo_sent < 1000))
 		return;
 	context->echo_sent = now;
 	if (!context->echo->Request(context->echo, (const BYTE*)&now, sizeof(now)))
