@@ -188,11 +188,14 @@ static BOOL emt_flush_tls(rdpEmt* emt)
 		/* the connection is a byte stream, so the server fills each datagram */
 		const BYTE* bytes = Stream_Buffer(emt->out);
 		const size_t total = Stream_GetPosition(emt->out);
-		for (size_t offset = 0; offset < total; offset += max)
+		size_t offset = 0;
+		while (offset < total)
 		{
+			/* the bytes left, not offset + max, which could wrap */
 			const size_t length = (total - offset > max) ? max : total - offset;
 			if (!rdpudp_send(emt->udp, &bytes[offset], length))
 				return FALSE;
+			offset += length;
 		}
 		return stream_consume(emt->out, total);
 	}
@@ -289,6 +292,8 @@ static BOOL emt_write_batch(rdpEmt* emt)
 	const size_t length = emt->batch ? Stream_GetPosition(emt->batch) : 0;
 	if (length == 0)
 		return TRUE;
+	if (length > INT32_MAX)
+		return FALSE;
 	const int total = WINPR_ASSERTING_INT_CAST(int, length);
 	const int rc = SSL_write(emt->ssl, Stream_Buffer(emt->batch), total);
 	Stream_ResetPosition(emt->batch);
@@ -315,15 +320,20 @@ static BOOL emt_batch_data(rdpEmt* emt, const BYTE* payload, size_t length)
 		if (!emt->batch)
 			return FALSE;
 	}
-	if ((Stream_GetPosition(emt->batch) + RDPTUNNEL_HEADER_LENGTH + length > RDPEMT_SERVER_BATCH) &&
+	/* the room left, rather than a sum that could wrap; a PDU larger than a batch goes alone */
+	const size_t pdu = RDPTUNNEL_HEADER_LENGTH + length;
+	const size_t used = Stream_GetPosition(emt->batch);
+	if (((used > RDPEMT_SERVER_BATCH) || (RDPEMT_SERVER_BATCH - used < pdu)) &&
 	    !emt_write_batch(emt))
 		return FALSE;
-	if (!Stream_EnsureRemainingCapacity(emt->batch, RDPTUNNEL_HEADER_LENGTH + length))
+	if (!Stream_EnsureRemainingCapacity(emt->batch, pdu))
 		return FALSE;
 
 	/* [MS-RDPEMT] 2.2.1.1 RDP_TUNNEL_HEADER */
-	Stream_Write_UINT8(emt->batch, RDPTUNNEL_ACTION_DATA & 0x0F);
-	Stream_Write_UINT16(emt->batch, WINPR_ASSERTING_INT_CAST(UINT16, length));
+	const UINT8 actionByte = WINPR_ASSERTING_INT_CAST(UINT8, RDPTUNNEL_ACTION_DATA & 0x0F);
+	const UINT16 payloadLength = WINPR_ASSERTING_INT_CAST(UINT16, length);
+	Stream_Write_UINT8(emt->batch, actionByte);
+	Stream_Write_UINT16(emt->batch, payloadLength);
 	Stream_Write_UINT8(emt->batch, RDPTUNNEL_HEADER_LENGTH);
 	Stream_Write(emt->batch, payload, length);
 	return TRUE;
@@ -420,7 +430,9 @@ static BOOL emt_accept_create_request(rdpEmt* emt, wStream* s, size_t payloadLen
 	WINPR_ASSERT(emt);
 	WINPR_ASSERT(s);
 
-	if (payloadLength < 24)
+	/* emt_process_pdus checked that the payload is present, checked here again before it is read */
+	if ((payloadLength < 8 + sizeof(emt->cookie)) ||
+	    !Stream_CheckAndLogRequiredLengthWLog(emt->log, s, payloadLength))
 	{
 		emt_fail(emt, "short Tunnel Create Request");
 		return FALSE;
@@ -435,7 +447,14 @@ static BOOL emt_accept_create_request(rdpEmt* emt, wStream* s, size_t payloadLen
 	BYTE response[4] = WINPR_C_ARRAY_INIT;
 	wStream rbuffer = WINPR_C_ARRAY_INIT;
 	wStream* rs = Stream_StaticInit(&rbuffer, response, sizeof(response));
-	Stream_Write_UINT32(rs, valid ? (UINT32)S_OK : (UINT32)E_ABORT); /* HrResponse */
+	if (!rs)
+	{
+		emt_fail(emt, "failed to build the Tunnel Create Response");
+		return FALSE;
+	}
+	/* HRESULT bit patterns, E_ABORT is negative as an int32 */
+	const UINT32 hr = valid ? (UINT32)S_OK : (UINT32)E_ABORT;
+	Stream_Write_UINT32(rs, hr); /* HrResponse */
 	if (!emt_write_pdu(emt, RDPTUNNEL_ACTION_CREATERESPONSE, nullptr, 0, response,
 	                   sizeof(response)))
 	{
@@ -449,7 +468,8 @@ static BOOL emt_accept_create_request(rdpEmt* emt, wStream* s, size_t payloadLen
 	}
 	if (!emt->ready)
 	{
-		WLog_Print(emt->log, WLOG_INFO, "UDP multitransport tunnel ready (RDP-UDP version 0x%04" PRIx16 ")",
+		WLog_Print(emt->log, WLOG_INFO,
+		           "UDP multitransport tunnel ready (RDP-UDP version 0x%04" PRIx16 ")",
 		           rdpudp_get_version(emt->udp));
 		emt->ready = TRUE;
 		emt->callback(emt->custom, emt, RDPEMT_EVENT_READY, nullptr, 0);
@@ -539,6 +559,11 @@ static BOOL emt_process_pdus(rdpEmt* emt)
 
 			case RDPTUNNEL_ACTION_DATA:
 				/* [MS-RDPEMT] 2.2.2.3 RDP_TUNNEL_DATA, HigherLayerData is a DVC PDU */
+				if (emt->server && !emt->ready)
+				{
+					emt_fail(emt, "tunnel data before the Tunnel Create Request");
+					return FALSE;
+				}
 				if (payloadLength > 0)
 					emt->callback(emt->custom, emt, RDPEMT_EVENT_DATA, Stream_ConstPointer(s),
 					              payloadLength);
@@ -863,6 +888,9 @@ static DWORD WINAPI emt_thread(LPVOID arg)
 WINPR_ATTR_NODISCARD
 static BOOL emt_cookie_hash(const BYTE cookie[16], BYTE cookieHash[32])
 {
+	WINPR_ASSERT(cookie);
+	WINPR_ASSERT(cookieHash);
+
 	BYTE digest[32] = WINPR_C_ARRAY_INIT;
 	if (!winpr_Digest(WINPR_MD_SHA256, cookie, 16, digest, sizeof(digest)))
 		return FALSE;
@@ -870,6 +898,8 @@ static BOOL emt_cookie_hash(const BYTE cookie[16], BYTE cookieHash[32])
 	wStream hbuffer = WINPR_C_ARRAY_INIT;
 	wStream* ds = Stream_StaticConstInit(&dbuffer, digest, sizeof(digest));
 	wStream* hs = Stream_StaticInit(&hbuffer, cookieHash, 32);
+	if (!ds || !hs)
+		return FALSE;
 	for (size_t x = 0; x < 32 / 4; x++)
 	{
 		/* the Stream_Write macros evaluate their value more than once */
@@ -944,6 +974,8 @@ static BOOL emt_server_input(void* custom, SOCKET sockfd, const struct sockaddr*
 {
 	rdpEmt* emt = custom;
 	WINPR_ASSERT(emt);
+	WINPR_ASSERT(addr);
+	WINPR_ASSERT(data);
 
 	EnterCriticalSection(&emt->lock);
 	BOOL rc = !emt->failed;
@@ -999,9 +1031,12 @@ rdpEmt* rdpemt_new_server(wLog* log, UINT16 port, UINT32 requestId, const BYTE* 
 		return nullptr;
 	}
 
-	if ((X509_up_ref(cert) != 1) || (EVP_PKEY_up_ref(key) != 1))
+	/* each reference is kept as soon as it is taken, so rdpemt_free drops it on failure */
+	if (X509_up_ref(cert) != 1)
 		goto fail;
 	emt->cert = cert;
+	if (EVP_PKEY_up_ref(key) != 1)
+		goto fail;
 	emt->key = key;
 
 	if (!emt_cookie_hash(emt->cookie, emt->cookieHash))

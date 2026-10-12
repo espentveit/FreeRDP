@@ -1358,16 +1358,17 @@ static BOOL transport_get_address(rdpTransport* transport, BOOL local,
 		(void)BIO_get_fd(transport->tls->underlying, &sockfd);
 	if (sockfd < 0)
 	{
-		WLog_Print(transport->log, WLOG_DEBUG, "no socket found for the peer address");
+		WLog_Print(transport->log, WLOG_DEBUG, "no socket found for the %s address",
+		           local ? "local" : "peer");
 		return FALSE;
 	}
 
-	socklen_t len = sizeof(*address);
+	socklen_t len = WINPR_ASSERTING_INT_CAST(socklen_t, sizeof(*address));
 	const int rc = local ? getsockname(sockfd, (struct sockaddr*)address, &len)
 	                     : getpeername(sockfd, (struct sockaddr*)address, &len);
 	if (rc != 0)
 		return FALSE;
-	*length = len;
+	*length = WINPR_ASSERTING_INT_CAST(size_t, len);
 	return TRUE;
 }
 

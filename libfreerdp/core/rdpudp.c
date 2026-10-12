@@ -441,7 +441,11 @@ static UINT32 rto_initial(const rdpUdp* udp)
 		rto = (rtt2 > floor) ? rtt2 : floor;
 	}
 	if (udp->version == RDPUDP_PROTOCOL_VERSION_3)
+	{
+		/* srtt and margin are below 2^35, the shift stays far from the top of 64 bits */
+		WINPR_ASSERT(udp->rtoBackoff <= RDPUDP2_MAX_RTO_BACKOFF);
 		rto <<= udp->rtoBackoff;
+	}
 	return (rto > RDPUDP_MAX_RTO_MS) ? RDPUDP_MAX_RTO_MS : WINPR_ASSERTING_INT_CAST(UINT32, rto);
 }
 
@@ -1238,9 +1242,10 @@ static void cc_round(rdpUdp* udp)
 	if (now - udp->ccRoundStart < rtt)
 		return;
 
-	const UINT32 total = udp->ccRoundAcked + udp->ccRoundLost;
+	/* 64 bits: the two counters cannot wrap their sum */
+	const UINT64 total = (UINT64)udp->ccRoundAcked + udp->ccRoundLost;
 	const BOOL lossy = (total >= RDPUDP2_ROUND_MIN_SAMPLES) &&
-	                   (udp->ccRoundLost * 100ull >= total * 1ull * RDPUDP2_CONGESTED_LOSS_PERCENT);
+	                   (udp->ccRoundLost * 100ull >= total * RDPUDP2_CONGESTED_LOSS_PERCENT);
 	const BOOL queued = cc_queue_building(udp);
 	if (lossy || queued)
 	{
@@ -1249,7 +1254,7 @@ static void cc_round(rdpUdp* udp)
 		udp->cwnd = udp->ssthresh;
 		udp->ccAcked = 0;
 		WLog_Print(udp->log, WLOG_DEBUG,
-		           "congested (%" PRIu32 " of %" PRIu32 " lost, round trip %" PRIu32 " ms, "
+		           "congested (%" PRIu32 " of %" PRIu64 " lost, round trip %" PRIu32 " ms, "
 		           "lowest %" PRIu32 " ms), congestion window %" PRIu32,
 		           udp->ccRoundLost, total, udp->srtt, udp->rttMin, udp->cwnd);
 	}
@@ -1597,6 +1602,10 @@ static void v3_process_ack_vector(rdpUdp* udp, UINT16 base, wStream* s, size_t c
 {
 	WINPR_ASSERT(udp);
 	WINPR_ASSERT(s);
+	/* count comes from the wire, the 7 bit codedAckVecSize bounds it and v3_process_datagram
+	 * checked that many bytes are present */
+	WINPR_ASSERT(count <= RDPUDP2_MAX_ACKVEC);
+	WINPR_ASSERT(Stream_GetRemainingLength(s) >= count);
 
 	/* 127 entries of at most 63 (run length) or 7 (state map) datagrams */
 	BYTE received[RDPUDP2_MAX_ACKVEC * 63] = WINPR_C_ARRAY_INIT;
@@ -1612,7 +1621,7 @@ static void v3_process_ack_vector(rdpUdp* udp, UINT16 base, wStream* s, size_t c
 			const BYTE run = entry & 0x3F;
 			for (BYTE y = 0; (y < run) && (covered < ARRAYSIZE(received)); y++)
 			{
-				received[covered++] = got;
+				received[covered++] = got ? 1 : 0;
 				if (got)
 					highest = covered;
 			}
@@ -1623,7 +1632,7 @@ static void v3_process_ack_vector(rdpUdp* udp, UINT16 base, wStream* s, size_t c
 			for (BYTE bit = 0; (bit < 7) && (covered < ARRAYSIZE(received)); bit++)
 			{
 				const BOOL got = (entry & (1 << bit)) != 0;
-				received[covered++] = got;
+				received[covered++] = got ? 1 : 0;
 				if (got)
 					highest = covered;
 			}
@@ -2046,7 +2055,7 @@ static BOOL is_syn(const BYTE* data, size_t length)
 	WINPR_ASSERT(data || (length == 0));
 	if (length < 8)
 		return FALSE;
-	const UINT16 flags = (UINT16)((data[6] << 8) | data[7]);
+	const UINT16 flags = WINPR_ASSERTING_INT_CAST(UINT16, (data[6] << 8) | data[7]);
 	return (data[0] == 0xFF) && (data[1] == 0xFF) && (data[2] == 0xFF) && (data[3] == 0xFF) &&
 	       ((flags & (RDPUDP_FLAG_SYN | RDPUDP_FLAG_ACK)) == RDPUDP_FLAG_SYN);
 }
@@ -2057,9 +2066,16 @@ static BOOL process_datagram(rdpUdp* udp, const BYTE* data, size_t length)
 	WINPR_ASSERT(udp);
 	WINPR_ASSERT(data);
 
-	/* the client did not get our SYN+ACK and sends its SYN again */
+	/* the client did not get our SYN+ACK and sends its SYN again. A SYN is padded to the MTU
+	 * ([MS-RDPEUDP] 3.1.5.1.1), so a real one is never shorter than our answer: a short one could
+	 * come from a spoofed source and make us send more than we got. */
 	if (udp->server && is_syn(data, length))
 	{
+		if (length < udp->synAckLength)
+		{
+			WLog_Print(udp->log, WLOG_DEBUG, "ignoring a repeated SYN shorter than the MTU");
+			return TRUE;
+		}
 		WLog_Print(udp->log, WLOG_DEBUG, "repeated SYN, sending the SYN+ACK again");
 		return rdpudp_send_raw(udp, udp->synAck, udp->synAckLength);
 	}
@@ -2312,9 +2328,14 @@ WINPR_ATTR_NODISCARD
 static BOOL build_syn_ack(rdpUdp* udp, UINT32 clientInitial)
 {
 	WINPR_ASSERT(udp);
+	/* rdpudp_accept clamps the MTU to [RDPUDP_MIN_MTU, RDPUDP_MTU], the size of synAck */
+	if ((udp->mtu < RDPUDP_MIN_MTU) || (udp->mtu > sizeof(udp->synAck)))
+		return FALSE;
 	memset(udp->synAck, 0, sizeof(udp->synAck));
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticInit(&sbuffer, udp->synAck, sizeof(udp->synAck));
+	if (!s)
+		return FALSE;
 
 	/* RDPUDP_FEC_HEADER */
 	Stream_Write_UINT32_BE(s, clientInitial); /* snSourceAck */
@@ -2341,13 +2362,14 @@ BOOL rdpudp_accept(rdpUdp* udp, SOCKET sockfd, const struct sockaddr* addr, size
 	WINPR_ASSERT(addr);
 	WINPR_ASSERT(syn);
 
-	if ((udp->state != RDPUDP_STATE_CLOSED) || (addrlen > sizeof(udp->peerAddr)) ||
-	    !is_syn(syn, length))
+	/* without an address, rdpudp_send_raw would send on the unconnected shared socket */
+	if ((udp->state != RDPUDP_STATE_CLOSED) || (addrlen == 0) ||
+	    (addrlen > sizeof(udp->peerAddr)) || !is_syn(syn, length))
 		return FALSE;
 
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&sbuffer, syn, length);
-	if (!Stream_CheckAndLogRequiredLengthWLog(udp->log, s, 16))
+	if (!s || !Stream_CheckAndLogRequiredLengthWLog(udp->log, s, 16))
 		return FALSE;
 
 	/* RDPUDP_FEC_HEADER */
@@ -2425,7 +2447,8 @@ BOOL rdpudp_get_syn_cookie_hash(const BYTE* data, size_t length, BYTE hash[32])
 
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&sbuffer, data, length);
-	Stream_Seek(s, 6);
+	if (!s || !Stream_SafeSeek(s, 6)) /* snSourceAck, uReceiveWindowSize */
+		return FALSE;
 	const UINT16 flags = Stream_Get_UINT16_BE(s);
 	if (!(flags & RDPUDP_FLAG_SYNEX) || !Stream_SafeSeek(s, 8)) /* RDPUDP_SYNDATA_PAYLOAD */
 		return FALSE;
@@ -2444,7 +2467,7 @@ BOOL rdpudp_get_syn_cookie_hash(const BYTE* data, size_t length, BYTE hash[32])
 BOOL rdpudp_input(rdpUdp* udp, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(udp);
-	WINPR_ASSERT(data || (length == 0));
+	WINPR_ASSERT(data); /* an empty datagram still has a buffer, process_datagram needs it */
 
 	if (udp->state != RDPUDP_STATE_ESTABLISHED)
 		return FALSE;

@@ -703,9 +703,11 @@ static UINT sf_peer_echo_open_result(echo_server_context* echo, ECHO_SERVER_OPEN
 	return CHANNEL_RC_OK;
 }
 
+WINPR_ATTR_NODISCARD
 static UINT sf_peer_echo_response(echo_server_context* echo, const BYTE* buffer, UINT32 length)
 {
 	WINPR_ASSERT(echo);
+	WINPR_ASSERT(buffer || (length == 0));
 	UINT64 sent = 0;
 	if (length == sizeof(sent))
 	{
@@ -740,6 +742,7 @@ static void sf_peer_echo(testPeerContext* context)
 		WLog_WARN(TAG, "echo request failed");
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL tf_peer_post_connect(freerdp_peer* client)
 {
 	testPeerContext* context = nullptr;

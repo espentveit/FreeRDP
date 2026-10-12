@@ -213,9 +213,9 @@ static BOOL multitransport_server_start_tunnel(rdpMultitransport* multi)
 		return FALSE;
 	}
 	UINT16 port = 0;
-	if (local.ss_family == AF_INET)
+	if ((local.ss_family == AF_INET) && (localLength >= sizeof(struct sockaddr_in)))
 		port = ntohs(((const struct sockaddr_in*)&local)->sin_port);
-	else if (local.ss_family == AF_INET6)
+	else if ((local.ss_family == AF_INET6) && (localLength >= sizeof(struct sockaddr_in6)))
 		port = ntohs(((const struct sockaddr_in6*)&local)->sin6_port);
 	if (port == 0)
 	{
@@ -223,12 +223,17 @@ static BOOL multitransport_server_start_tunnel(rdpMultitransport* multi)
 		return FALSE;
 	}
 
+	X509* x509 = freerdp_certificate_get_x509(cert);
+	if (!x509)
+	{
+		WLog_INFO(TAG, "not offering UDP, the server certificate has no X.509 form");
+		return FALSE;
+	}
 	EVP_PKEY* evp = freerdp_key_get_evp_pkey(key);
 	if (!evp)
 		return FALSE;
 	rdpEmt* emt = rdpemt_new_server(WLog_Get(TAG), port, multi->reliableReqId, multi->reliableCookie,
-	                                freerdp_certificate_get_x509(cert), evp,
-	                                multitransport_tunnel_event, multi);
+	                                x509, evp, multitransport_tunnel_event, multi);
 	EVP_PKEY_free(evp);
 	if (!emt)
 	{
@@ -237,11 +242,14 @@ static BOOL multitransport_server_start_tunnel(rdpMultitransport* multi)
 	}
 
 	EnterCriticalSection(&multi->lock);
+	/* one request per connection; an earlier tunnel would otherwise be leaked */
+	rdpEmt* old = multi->reliable;
 	multi->reliable = emt;
 	multi->reliableState = FREERDP_MULTITRANSPORT_TUNNEL_PENDING;
 	multi->serverTunnelUp = FALSE;
 	multi->serverResponseOk = FALSE;
 	LeaveCriticalSection(&multi->lock);
+	rdpemt_free(old);
 	WLog_INFO(TAG, "offering a reliable UDP tunnel, request %" PRIu32, multi->reliableReqId);
 	return TRUE;
 }
@@ -609,6 +617,7 @@ WINPR_ATTR_NODISCARD
 static BOOL multitransport_handle_event(rdpMultitransport* multi, const mt_event* ev)
 {
 	WINPR_ASSERT(multi);
+	WINPR_ASSERT(multi->rdp);
 	WINPR_ASSERT(ev);
 
 	const BOOL server = freerdp_settings_get_bool(multi->rdp->settings, FreeRDP_ServerMode);
@@ -772,6 +781,7 @@ void multitransport_reset(rdpMultitransport* multi)
 		(void)ResetEvent(multi->event);
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL multitransport_server_check_ready(rdpMultitransport* multi)
 {
 	WINPR_ASSERT(multi);
@@ -795,6 +805,7 @@ static state_run_t multitransport_server_handle_response(rdpMultitransport* mult
 {
 	WINPR_ASSERT(multi);
 	rdpRdp* rdp = multi->rdp;
+	WINPR_ASSERT(rdp);
 
 	EnterCriticalSection(&multi->lock);
 	rdpEmt* emt = multi->reliable;

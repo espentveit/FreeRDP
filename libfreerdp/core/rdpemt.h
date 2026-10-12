@@ -92,7 +92,7 @@ FREERDP_LOCAL BOOL rdpemt_send_data(rdpEmt* emt, const BYTE* data, size_t length
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL rdpemt_send_subheader(rdpEmt* emt, const BYTE* subHeader, size_t length);
 
-/* Sends what rdpemt_send_data gathered on the server side. */
+/** Sends what rdpemt_send_data gathered on the server side. Thread safe. */
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL rdpemt_flush(rdpEmt* emt);
 

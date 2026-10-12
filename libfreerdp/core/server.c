@@ -57,20 +57,15 @@
 
 #define DVC_MAX_DATA_PDU_SIZE 1600
 
-/* Soft-Sync ([MS-RDPEDYC] 3.1.5.3) */
-enum
-{
-	SOFT_SYNC_STATE_NONE = 0,     /* every dynamic channel on TCP */
-	SOFT_SYNC_STATE_SENT = 1,     /* the request went out, the moved channels are written on UDP */
-	SOFT_SYNC_STATE_ANSWERED = 2, /* the client answered, its tunnel data is read */
-};
-
 /* Client PDUs from the tunnel held while waiting for its Soft-Sync Response. */
 #define SOFT_SYNC_MAX_BACKLOG 1024
 
 /* vcm->queue message ids: where a PDU for the drdynvc channel goes */
-#define WTS_QUEUE_TCP 0
-#define WTS_QUEUE_TUNNEL 1
+typedef enum WINPR_C23_ENUM_TYPE(uint32_t)
+{
+	WTS_QUEUE_TCP = 0,
+	WTS_QUEUE_TUNNEL = 1
+} WTS_QUEUE_ID;
 
 typedef struct
 {
@@ -122,6 +117,7 @@ static BOOL wts_queue_receive_data(rdpPeerChannel* channel, const BYTE* Buffer1,
 	return MessageQueue_Post(channel->queue, messageCtx, 0, nullptr, nullptr);
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL wts_queue_send_item_on(rdpPeerChannel* channel, BYTE* Buffer, UINT32 Length,
                                    BOOL tunnel)
 {
@@ -133,13 +129,13 @@ static BOOL wts_queue_send_item_on(rdpPeerChannel* channel, BYTE* Buffer, UINT32
 	buffer = Buffer;
 	length = Length;
 
-	WINPR_ASSERT(channel->channelId <= UINT16_MAX);
-	const UINT16 channelId = (UINT16)channel->channelId;
-	return MessageQueue_Post(channel->vcm->queue, (void*)(UINT_PTR)channelId,
-	                         tunnel ? WTS_QUEUE_TUNNEL : WTS_QUEUE_TCP, (void*)buffer,
+	const UINT16 channelId = WINPR_ASSERTING_INT_CAST(UINT16, channel->channelId);
+	const WTS_QUEUE_ID id = tunnel ? WTS_QUEUE_TUNNEL : WTS_QUEUE_TCP;
+	return MessageQueue_Post(channel->vcm->queue, (void*)(UINT_PTR)channelId, id, (void*)buffer,
 	                         (void*)(UINT_PTR)length);
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL wts_queue_send_item(rdpPeerChannel* channel, BYTE* Buffer, UINT32 Length)
 {
 	return wts_queue_send_item_on(channel, Buffer, Length, FALSE);
@@ -152,17 +148,20 @@ static BOOL wts_queue_drdynvc_pdu(WTSVirtualChannelManager* vcm, const BYTE* dat
 {
 	WINPR_ASSERT(vcm);
 	WINPR_ASSERT(vcm->drdynvc_channel);
+	WINPR_ASSERT(data || (length == 0));
 	if ((length == 0) || (length > UINT32_MAX))
 		return FALSE;
 	BYTE* buffer = malloc(length);
 	if (!buffer)
 		return FALSE;
 	memcpy(buffer, data, length);
-	if (!wts_queue_send_item_on(vcm->drdynvc_channel, buffer, (UINT32)length, tunnel))
+	if (!wts_queue_send_item_on(vcm->drdynvc_channel, buffer,
+	                            WINPR_ASSERTING_INT_CAST(UINT32, length), tunnel))
 	{
 		free(buffer);
 		return FALSE;
 	}
+	// NOLINTNEXTLINE(clang-analyzer-unix.Malloc): the queue takes ownership of buffer
 	return TRUE;
 }
 
@@ -455,11 +454,14 @@ WINPR_ATTR_NODISCARD
 static BOOL wts_read_tunnel_pdu(WTSVirtualChannelManager* vcm, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(vcm);
+	WINPR_ASSERT(data || (length == 0));
 	if (!vcm->drdynvc_channel || (vcm->drdynvc_state != DRDYNVC_STATE_READY) || (length < 1))
 		return FALSE;
 
 	wStream buffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&buffer, data, length);
+	if (!s)
+		return FALSE;
 	const UINT8 value = Stream_Get_UINT8(s);
 	const UINT8 Cmd = (value & 0xf0) >> 4;
 	const UINT8 Sp = (value & 0x0c) >> 2;
@@ -479,6 +481,7 @@ static BOOL wts_read_tunnel_pdu(WTSVirtualChannelManager* vcm, const BYTE* data,
 
 /* [MS-RDPEDYC] 2.2.5.2 DYNVC_SOFT_SYNC_RESPONSE: the client reads and writes the tunnels it
  * names, and the server reads them from now on (3.3.5.3.2). */
+WINPR_ATTR_NODISCARD
 static BOOL wts_read_soft_sync_response(WTSVirtualChannelManager* vcm, wStream* s)
 {
 	WINPR_ASSERT(vcm);
@@ -554,19 +557,29 @@ static BOOL wts_soft_sync(WTSVirtualChannelManager* vcm)
 		rc = TRUE;
 		goto out;
 	}
+	/* NumberOfDVCs is 16 bits */
+	if (count > UINT16_MAX)
+	{
+		WLog_ERR(TAG, "%" PRIuz " dynamic channels are too many for a Soft-Sync Request", count);
+		goto out;
+	}
 
 	/* DYNVC_SOFT_SYNC_REQUEST: Length counts from the Length field on */
-	const size_t listLength = 4 + 2 + 4 * count;
+	const size_t listLength = 4 + 2 + sizeof(UINT32) * count;
 	s = Stream_New(nullptr, 2 + 4 + 2 + 2 + listLength);
 	if (!s)
 		goto out;
-	Stream_Write_UINT8(s, (SOFT_SYNC_REQUEST_PDU << 4) & 0xFF);
-	Stream_Write_UINT8(s, 0);                                                 /* Pad */
-	Stream_Write_UINT32(s, WINPR_ASSERTING_INT_CAST(UINT32, 4 + 2 + 2 + listLength)); /* Length */
-	Stream_Write_UINT16(s, SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT);   /* Flags */
-	Stream_Write_UINT16(s, 1);                                       /* NumberOfTunnels */
-	Stream_Write_UINT32(s, TUNNELTYPE_UDPFECR);                      /* TunnelType */
-	Stream_Write_UINT16(s, WINPR_ASSERTING_INT_CAST(UINT16, count)); /* NumberOfDVCs */
+	/* the Stream_Write macros evaluate their value more than once */
+	const UINT8 header = WINPR_ASSERTING_INT_CAST(UINT8, (SOFT_SYNC_REQUEST_PDU << 4) & 0xFF);
+	const UINT32 length = WINPR_ASSERTING_INT_CAST(UINT32, 4 + 2 + 2 + listLength);
+	const UINT16 dvcs = WINPR_ASSERTING_INT_CAST(UINT16, count);
+	Stream_Write_UINT8(s, header);
+	Stream_Write_UINT8(s, 0);                                                       /* Pad */
+	Stream_Write_UINT32(s, length);                                                 /* Length */
+	Stream_Write_UINT16(s, SOFT_SYNC_TCP_FLUSHED | SOFT_SYNC_CHANNEL_LIST_PRESENT); /* Flags */
+	Stream_Write_UINT16(s, 1);                  /* NumberOfTunnels */
+	Stream_Write_UINT32(s, TUNNELTYPE_UDPFECR); /* TunnelType */
+	Stream_Write_UINT16(s, dvcs);               /* NumberOfDVCs */
 	for (size_t x = 0; x < count; x++)
 		Stream_Write_UINT32(s, channels[x]->channelId);
 
@@ -598,11 +611,13 @@ out:
 	return rc;
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL wts_tunnel_data_received(void* custom, UINT32 tunnelType, const BYTE* data,
                                      size_t length)
 {
 	WTSVirtualChannelManager* vcm = custom;
 	WINPR_ASSERT(vcm);
+	WINPR_ASSERT(data || (length == 0));
 	WINPR_UNUSED(tunnelType);
 
 	/* [MS-RDPEDYC] 3.3.5.3.2: nothing from the tunnel is read before the Soft-Sync Response */
@@ -627,6 +642,7 @@ static BOOL wts_tunnel_data_received(void* custom, UINT32 tunnelType, const BYTE
 	return wts_read_tunnel_pdu(vcm, data, length);
 }
 
+WINPR_ATTR_NODISCARD
 static BOOL wts_tunnel_state_changed(void* custom, UINT32 tunnelType,
                                      FreeRDP_MultitransportTunnelState state)
 {
@@ -2128,8 +2144,8 @@ BOOL WINAPI FreeRDP_WTSVirtualChannelWrite(HANDLE hChannelHandle, PCHAR Buffer, 
 			Length -= written;
 			Buffer += written;
 			totalWritten += written;
-			if (!wts_queue_send_item_on(channel->vcm->drdynvc_channel, buffer, (UINT32)length,
-			                            channel->tunnel))
+			if (!wts_queue_send_item_on(channel->vcm->drdynvc_channel, buffer,
+			                            WINPR_ASSERTING_INT_CAST(UINT32, length), channel->tunnel))
 				goto fail;
 		}
 	}

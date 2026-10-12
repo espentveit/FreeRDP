@@ -88,6 +88,7 @@ struct s_udp_listener
 static udpListener g_listener;
 static INIT_ONCE g_listenerOnce = INIT_ONCE_STATIC_INIT;
 
+WINPR_ATTR_NODISCARD
 static BOOL CALLBACK udplistener_init(WINPR_ATTR_UNUSED PINIT_ONCE once,
                                       WINPR_ATTR_UNUSED PVOID param,
                                       WINPR_ATTR_UNUSED PVOID* context)
@@ -109,7 +110,7 @@ static BOOL sockaddr_equal(const struct sockaddr_storage* a, const struct sockad
 {
 	WINPR_ASSERT(a);
 	WINPR_ASSERT(b);
-	if (a->ss_family != b->sa_family)
+	if ((blen < sizeof(b->sa_family)) || (a->ss_family != b->sa_family))
 		return FALSE;
 	if (a->ss_family == AF_INET)
 	{
@@ -132,6 +133,7 @@ static BOOL sockaddr_equal(const struct sockaddr_storage* a, const struct sockad
 static void udplistener_remove_session(udpListener* listener, size_t index)
 {
 	WINPR_ASSERT(listener);
+	WINPR_ASSERT(listener->sessions);
 	WINPR_ASSERT(index < listener->sessionCount);
 	listener->sessionCount--;
 	listener->sessions[index] = listener->sessions[listener->sessionCount];
@@ -142,6 +144,8 @@ static void udplistener_dispatch(udpListener* listener, SOCKET sockfd, const str
                                  size_t addrlen, const BYTE* data, size_t length)
 {
 	WINPR_ASSERT(listener);
+	WINPR_ASSERT(addr);
+	WINPR_ASSERT(data || (length == 0));
 
 	size_t index = listener->sessionCount;
 	for (size_t x = 0; x < listener->sessionCount; x++)
@@ -185,6 +189,7 @@ static void udplistener_dispatch(udpListener* listener, SOCKET sockfd, const str
 	}
 
 	const udpListenerSession* session = &listener->sessions[index];
+	WINPR_ASSERT(session->input);
 	if (!session->input(session->custom, sockfd, addr, addrlen, data, length))
 		udplistener_remove_session(listener, index);
 }
@@ -241,7 +246,7 @@ static DWORD WINAPI udplistener_thread(LPVOID arg)
 			while (TRUE)
 			{
 				struct sockaddr_storage addr = WINPR_C_ARRAY_INIT;
-				int addrlen = sizeof(addr);
+				int addrlen = WINPR_ASSERTING_INT_CAST(int, sizeof(addr));
 				const int rc = _recvfrom(sockfd, (char*)listener->buffer,
 				                         WINPR_ASSERTING_INT_CAST(int, sizeof(listener->buffer)), 0,
 				                         (struct sockaddr*)&addr, &addrlen);
@@ -274,7 +279,8 @@ static BOOL udplistener_open_port(udpListener* listener, UINT16 port)
 	}
 
 	char service[16] = WINPR_C_ARRAY_INIT;
-	(void)_snprintf(service, sizeof(service), "%" PRIu16, port);
+	if (_snprintf(service, sizeof(service), "%" PRIu16, port) < 0)
+		return FALSE;
 	struct addrinfo hints = WINPR_C_ARRAY_INIT;
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
@@ -292,6 +298,9 @@ static BOOL udplistener_open_port(udpListener* listener, UINT16 port)
 		if ((ai->ai_family != AF_INET) && (ai->ai_family != AF_INET6))
 			continue;
 
+		/* room for one more, without an overflowing size */
+		if (listener->socketCount >= SIZE_MAX / sizeof(udpListenerSocket) - 1)
+			break;
 		udpListenerSocket* sockets =
 		    realloc(listener->sockets, (listener->socketCount + 1) * sizeof(udpListenerSocket));
 		if (!sockets)
@@ -351,6 +360,9 @@ BOOL udplistener_register(UINT16 port, const BYTE cookieHash[32], udpListenerInp
 	if (!udplistener_open_port(listener, port))
 		goto out;
 
+	/* room for one more, without an overflowing size */
+	if (listener->sessionCount >= SIZE_MAX / sizeof(udpListenerSession) - 1)
+		goto out;
 	udpListenerSession* sessions =
 	    realloc(listener->sessions, (listener->sessionCount + 1) * sizeof(udpListenerSession));
 	if (!sessions)
@@ -410,6 +422,7 @@ void udplistener_unregister(void* custom)
 	{
 		/* the thread's own flag: a session that registers before it ended starts another */
 		ctx = listener->threadCtx;
+		WINPR_ASSERT(ctx);
 		ctx->stop = TRUE;
 		listener->threadCtx = nullptr;
 		thread = listener->thread;

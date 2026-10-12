@@ -49,6 +49,14 @@ enum
 	DVC_OPEN_STATE_CLOSED = 3
 };
 
+/* Soft-Sync ([MS-RDPEDYC] 3.1.5.3) */
+typedef enum WINPR_C23_ENUM_TYPE(uint8_t)
+{
+	SOFT_SYNC_STATE_NONE = 0,     /* every dynamic channel on TCP */
+	SOFT_SYNC_STATE_SENT = 1,     /* the request went out, the moved channels are written on UDP */
+	SOFT_SYNC_STATE_ANSWERED = 2, /* the client answered, its tunnel data is read */
+} WTS_SOFT_SYNC_STATE;
+
 struct rdp_peer_channel
 {
 	WTSVirtualChannelManager* vcm;
@@ -97,7 +105,7 @@ struct WTSVirtualChannelManager
 	/* [MS-RDPEDYC] 3.1.5.3 Soft-Sync, on the thread that runs the connection */
 	BOOL tunnelReady;
 	BOOL softSyncDue; /* a channel opened, Soft-Sync may move it */
-	BYTE softSyncState;
+	WTS_SOFT_SYNC_STATE softSyncState;
 	wQueue* tunnelBacklog; /* client PDUs from the tunnel before its Soft-Sync Response */
 };
 
