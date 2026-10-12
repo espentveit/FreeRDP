@@ -503,8 +503,17 @@ static BOOL wts_read_soft_sync_response(WTSVirtualChannelManager* vcm, wStream* 
 		return TRUE;
 	}
 	vcm->softSyncState = SOFT_SYNC_STATE_ANSWERED;
+	vcm->clientOnTunnel = reliable;
 	WLog_INFO(TAG, "Soft-Sync Response: the client %s the reliable UDP tunnel",
 	          reliable ? "writes on" : "does not use");
+
+	/* [MS-RDPEDYC] 3.2.5.3.2: the response names every tunnel the client writes on. The server
+	 * keeps writing on the tunnel its request named, but reads only what the client named. */
+	if (!reliable && (Queue_Count(vcm->tunnelBacklog) > 0))
+	{
+		WLog_ERR(TAG, "the client wrote on a tunnel its Soft-Sync Response does not name");
+		return FALSE;
+	}
 
 	wStream* held = nullptr;
 	while ((held = Queue_Dequeue(vcm->tunnelBacklog)))
@@ -638,6 +647,11 @@ static BOOL wts_tunnel_data_received(void* custom, UINT32 tunnelType, const BYTE
 			return FALSE;
 		}
 		return TRUE;
+	}
+	if (!vcm->clientOnTunnel)
+	{
+		WLog_ERR(TAG, "the client writes on a tunnel its Soft-Sync Response does not name");
+		return FALSE;
 	}
 	return wts_read_tunnel_pdu(vcm, data, length);
 }

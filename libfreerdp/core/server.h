@@ -106,6 +106,7 @@ struct WTSVirtualChannelManager
 	BOOL tunnelReady;
 	BOOL softSyncDue; /* a channel opened, Soft-Sync may move it */
 	WTS_SOFT_SYNC_STATE softSyncState;
+	BOOL clientOnTunnel; /* the Soft-Sync Response named the tunnel, the client writes on it */
 	wQueue* tunnelBacklog; /* client PDUs from the tunnel before its Soft-Sync Response */
 };
 
