@@ -1060,7 +1060,8 @@ BOOL fastpath_send_multiple_input_pdu(rdpFastPath* fastpath, wStream* s, size_t 
 	}
 
 	/* [MS-RDPECI]: once the Core Input Virtual Channel is set up the events go there, as they
-	 * are; the fast-path PDU around them is not sent */
+	 * are; the fast-path PDU around them is not sent. Events the channel could not take, such as
+	 * while it closes, still go in the fast-path PDU. */
 	{
 		const size_t offset = 3ull + fastpath_get_sec_bytes(rdp);
 		const size_t end = Stream_GetPosition(s);
@@ -1069,8 +1070,13 @@ BOOL fastpath_send_multiple_input_pdu(rdpFastPath* fastpath, wStream* s, size_t 
 		    input_redirect_events(rdp->input, Stream_Buffer(s) + offset, end - offset, iNumEvents,
 		                          &sent))
 		{
-			rc = sent;
-			goto fail;
+			if (sent)
+			{
+				rc = TRUE;
+				goto fail;
+			}
+			WLog_DBG(TAG, "core input channel did not take %" PRIuz " events, sending fast-path",
+			         iNumEvents);
 		}
 	}
 

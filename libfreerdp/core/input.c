@@ -1273,7 +1273,12 @@ rdpInput* input_new(rdpRdp* rdp)
 		return nullptr;
 	}
 
-	InitializeCriticalSection(&input->redirectLock);
+	if (!InitializeCriticalSectionEx(&input->redirectLock, 0, 0))
+	{
+		MessageQueue_Free(input->queue);
+		free(input);
+		return nullptr;
+	}
 	return &input->common;
 }
 
