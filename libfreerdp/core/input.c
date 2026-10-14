@@ -1174,6 +1174,79 @@ int input_process_events(rdpInput* input)
 	return input_message_queue_process_pending_messages(input);
 }
 
+/* A redirect of the fast-path input events, see freerdp_input_set_events_redirect. The input
+ * holds one reference and a send in progress another, so custom outlives both. */
+struct rdp_input_redirect
+{
+	volatile LONG refs;
+	freerdp_input_events_redirect_fkt_t send;
+	void (*fnFree)(void* custom);
+	void* custom;
+};
+
+static void input_redirect_unref(struct rdp_input_redirect* redirect)
+{
+	if (!redirect || (InterlockedDecrement(&redirect->refs) != 0))
+		return;
+	IFCALL(redirect->fnFree, redirect->custom);
+	free(redirect);
+}
+
+BOOL freerdp_input_set_events_redirect(rdpInput* input, freerdp_input_events_redirect_fkt_t send,
+                                       void (*fnFree)(void* custom), void* custom)
+{
+	if (!input)
+		return FALSE;
+
+	rdp_input_internal* in = input_cast(input);
+	struct rdp_input_redirect* redirect = nullptr;
+	if (send)
+	{
+		redirect = calloc(1, sizeof(struct rdp_input_redirect));
+		if (!redirect)
+			return FALSE;
+		redirect->refs = 1;
+		redirect->send = send;
+		redirect->fnFree = fnFree;
+		redirect->custom = custom;
+	}
+
+	EnterCriticalSection(&in->redirectLock);
+	struct rdp_input_redirect* old = in->redirect;
+	if (!send && custom && old && (old->custom != custom))
+		old = nullptr; /* another redirect was set since, it stays */
+	else
+		in->redirect = redirect;
+	LeaveCriticalSection(&in->redirectLock);
+
+	input_redirect_unref(old);
+	return TRUE;
+}
+
+BOOL input_redirect_events(rdpInput* input, const BYTE* events, size_t length, size_t count,
+                           BOOL* sent)
+{
+	WINPR_ASSERT(input);
+	WINPR_ASSERT(sent);
+
+	rdp_input_internal* in = input_cast(input);
+	if (!InterlockedCompareExchangePointer((PVOID volatile*)&in->redirect, nullptr, nullptr))
+		return FALSE;
+
+	/* the send runs without the lock, the channel it writes on takes locks of its own */
+	EnterCriticalSection(&in->redirectLock);
+	struct rdp_input_redirect* redirect = in->redirect;
+	if (redirect)
+		(void)InterlockedIncrement(&redirect->refs);
+	LeaveCriticalSection(&in->redirectLock);
+	if (!redirect)
+		return FALSE;
+
+	*sent = redirect->send(redirect->custom, events, length, count);
+	input_redirect_unref(redirect);
+	return TRUE;
+}
+
 static void input_free_queued_message(void* obj)
 {
 	wMessage* msg = (wMessage*)obj;
@@ -1200,6 +1273,7 @@ rdpInput* input_new(rdpRdp* rdp)
 		return nullptr;
 	}
 
+	InitializeCriticalSection(&input->redirectLock);
 	return &input->common;
 }
 
@@ -1209,6 +1283,8 @@ void input_free(rdpInput* input)
 	{
 		rdp_input_internal* in = input_cast(input);
 
+		input_redirect_unref(in->redirect);
+		DeleteCriticalSection(&in->redirectLock);
 		MessageQueue_Free(in->queue);
 		free(in);
 	}
