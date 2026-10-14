@@ -29,6 +29,10 @@
 #include <freerdp/api.h>
 
 #include <winpr/stream.h>
+#include <winpr/synch.h>
+
+/* Where fast-path input events go instead, see freerdp_input_set_events_redirect. */
+struct rdp_input_redirect;
 
 typedef struct
 {
@@ -42,6 +46,9 @@ typedef struct
 	UINT16 lastX;
 	UINT16 lastY;
 	wLog* log;
+
+	CRITICAL_SECTION redirectLock;
+	struct rdp_input_redirect* redirect;
 } rdp_input_internal;
 
 WINPR_ATTR_NODISCARD
@@ -66,6 +73,13 @@ FREERDP_LOCAL int input_process_events(rdpInput* input);
 
 WINPR_ATTR_NODISCARD
 FREERDP_LOCAL BOOL input_register_client_callbacks(rdpInput* input);
+
+/** Sends the events of a fast-path input PDU with the redirect set by
+ *  freerdp_input_set_events_redirect, if there is one: FALSE leaves them to the fast-path PDU.
+ *  @param sent Set to the result of the redirect's send when it took the events */
+WINPR_ATTR_NODISCARD
+FREERDP_LOCAL BOOL input_redirect_events(rdpInput* input, const BYTE* events, size_t length,
+                                         size_t count, BOOL* sent);
 
 FREERDP_LOCAL void input_free(rdpInput* input);
 

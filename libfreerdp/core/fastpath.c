@@ -40,6 +40,7 @@
 #include "update.h"
 #include "surface.h"
 #include "fastpath.h"
+#include "input.h"
 #include "rdp.h"
 
 #include "../cache/pointer.h"
@@ -1123,6 +1124,21 @@ BOOL fastpath_send_multiple_input_pdu(rdpFastPath* fastpath, wStream* s, size_t 
 			           "called during deactivate-reactivate [%s], ignoring",
 			           rdp_state_string(state));
 			rc = TRUE;
+			goto fail;
+		}
+	}
+
+	/* [MS-RDPECI]: once the Core Input Virtual Channel is set up the events go there, as they
+	 * are; the fast-path PDU around them is not sent */
+	{
+		const size_t offset = 3ull + fastpath_get_sec_bytes(rdp);
+		const size_t end = Stream_GetPosition(s);
+		BOOL sent = FALSE;
+		if (rdp->input && (end > offset) &&
+		    input_redirect_events(rdp->input, Stream_Buffer(s) + offset, end - offset, iNumEvents,
+		                          &sent))
+		{
+			rc = sent;
 			goto fail;
 		}
 	}

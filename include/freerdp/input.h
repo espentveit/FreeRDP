@@ -128,6 +128,31 @@ extern "C"
 
 	FREERDP_API BOOL freerdp_input_send_focus_in_event(rdpInput* input, UINT16 toggleStates);
 
+	/** Sends a batch of input events another way than in a fast-path input PDU.
+	 *  @param custom The custom given to freerdp_input_set_events_redirect
+	 *  @param events The events, each an eventHeader byte and its payload as in a fast-path input
+	 *  PDU ([MS-RDPBCGR] 2.2.8.1.2.2)
+	 *  @param length The length of \b events in bytes
+	 *  @param count The number of events
+	 *  @return \b TRUE if the events were sent
+	 *  @since version 3.33.0 */
+	typedef BOOL (*freerdp_input_events_redirect_fkt_t)(void* custom, const BYTE* events,
+	                                                    size_t length, size_t count);
+
+	/** Sends the events of all fast-path input PDUs with @p send from now on, as the Core Input
+	 *  Virtual Channel Extension ([MS-RDPECI]) does once its channel is set up. @p fnFree is
+	 *  called with @p custom once the redirect is no longer used and no send is in progress. On
+	 *  failure the caller keeps @p custom.
+	 *
+	 *  A @p send of nullptr sends the events in fast-path input PDUs again; @p fnFree is not used
+	 *  then, and a @p custom other than nullptr only removes the redirect set with that
+	 *  @p custom, not one set since.
+	 *  @since version 3.33.0 */
+	WINPR_ATTR_NODISCARD
+	FREERDP_API BOOL freerdp_input_set_events_redirect(rdpInput* input,
+	                                                   freerdp_input_events_redirect_fkt_t send,
+	                                                   void (*fnFree)(void* custom), void* custom);
+
 	/** @brief stringify \b enum KBD_SYNC_FLAGS
 	 *
 	 *  @param flags \b enum KBD_SYNC_FLAGS flags
