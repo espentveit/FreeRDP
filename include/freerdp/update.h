@@ -243,6 +243,23 @@ extern "C"
 	FREERDP_API void rdp_update_lock(rdpUpdate* update);
 	FREERDP_API void rdp_update_unlock(rdpUpdate* update);
 
+	/** @brief Handles a pointer update that came another way than in a fast-path update PDU,
+	 *  such as on the Mouse Cursor Virtual Channel ([MS-RDPEMSC] 2.2.3.3), whose update types
+	 *  and payloads are those of the fast-path pointer updates ([MS-RDPBCGR] 2.2.9.1.2.1.5 to
+	 *  2.2.9.1.2.1.11). The update is handled with the update lock held.
+	 *
+	 *  @param update The update instance
+	 *  @param updateType The fast-path update type: 0x05 system null, 0x06 system default, 0x08
+	 *  position, 0x09 color, 0x0A cached, 0x0B pointer or 0x0C large pointer (the
+	 *  TS_UPDATETYPE_MOUSEPTR_* values of [MS-RDPEMSC] are the same)
+	 *  @param s The update's payload
+	 *
+	 *  @return \b TRUE if it is a pointer update and it was handled
+	 *  @since version 3.33.0
+	 */
+	WINPR_ATTR_NODISCARD
+	FREERDP_API BOOL freerdp_update_recv_pointer(rdpUpdate* update, UINT16 updateType, wStream* s);
+
 	/** @brief Get the number of RDP codec stats indices in use.
 	 *
 	 *  @return The number of RDP codec stats indices that will return a value
