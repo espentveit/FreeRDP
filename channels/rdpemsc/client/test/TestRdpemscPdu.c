@@ -25,15 +25,13 @@ static BOOL test_caps_advertise(void)
 	return TRUE;
 }
 
-static RDP_MOUSE_CURSOR_CAPVERSION read_confirm(const BYTE* data, size_t length,
-                                                RDP_MOUSE_CURSOR_PDUTYPE* pduType)
+static RDP_MOUSE_CURSOR_CAPVERSION read_confirm(const BYTE* data, size_t length, BYTE* pduType)
 {
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&sbuffer, data, length);
-	RDP_MOUSE_CURSOR_HEADER header = WINPR_C_ARRAY_INIT;
-	if (!rdpemsc_read_header(s, &header))
+	BYTE updateType = 0;
+	if (!rdpemsc_read_header(s, pduType, &updateType))
 		return RDP_MOUSE_CURSOR_CAPVERSION_INVALID;
-	*pduType = header.pduType;
 	return rdpemsc_read_caps_confirm(s);
 }
 
@@ -48,7 +46,7 @@ static BOOL test_caps_confirm(void)
 		                      0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00 };
 	const BYTE sizeTooLarge[] = { 0x02, 0x00, 0x00, 0x00, 0x43, 0x41, 0x50, 0x53,
 		                          0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00 };
-	RDP_MOUSE_CURSOR_PDUTYPE pduType = PDUTYPE_EMSC_RESERVED;
+	BYTE pduType = 0;
 
 	if ((read_confirm(windows, sizeof(windows), &pduType) != RDP_MOUSE_CURSOR_CAPVERSION_1) ||
 	    (pduType != PDUTYPE_SC_CAPS_CONFIRM))
@@ -79,17 +77,18 @@ static BOOL test_mouseptr_update_header(void)
 		                     0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x40, 0x00 };
 	wStream sbuffer = WINPR_C_ARRAY_INIT;
 	wStream* s = Stream_StaticConstInit(&sbuffer, windows, sizeof(windows));
-	RDP_MOUSE_CURSOR_HEADER header = WINPR_C_ARRAY_INIT;
+	BYTE pduType = 0;
+	BYTE updateType = 0;
 
-	if (!rdpemsc_read_header(s, &header) || (header.pduType != PDUTYPE_SC_MOUSEPTR_UPDATE) ||
-	    (header.updateType != TS_UPDATETYPE_MOUSEPTR_POINTER) ||
+	if (!rdpemsc_read_header(s, &pduType, &updateType) || (pduType != PDUTYPE_SC_MOUSEPTR_UPDATE) ||
+	    (updateType != TS_UPDATETYPE_MOUSEPTR_POINTER) ||
 	    (Stream_GetPosition(s) != RDPEMSC_HEADER_SIZE))
 	{
 		(void)fprintf(stderr, "pointer update: header not read\n");
 		return FALSE;
 	}
 
-	const TS_UPDATETYPE_MOUSEPTR known[] = {
+	const BYTE known[] = {
 		TS_UPDATETYPE_MOUSEPTR_SYSTEM_NULL, TS_UPDATETYPE_MOUSEPTR_SYSTEM_DEFAULT,
 		TS_UPDATETYPE_MOUSEPTR_POSITION,    TS_UPDATETYPE_MOUSEPTR_CACHED,
 		TS_UPDATETYPE_MOUSEPTR_POINTER,     TS_UPDATETYPE_MOUSEPTR_LARGE_POINTER
@@ -98,13 +97,12 @@ static BOOL test_mouseptr_update_header(void)
 	{
 		if (!rdpemsc_is_mouseptr_update_type(known[x]))
 		{
-			(void)fprintf(stderr, "pointer update: type 0x%02x refused\n", known[x]);
+			(void)fprintf(stderr, "pointer update: type 0x%02" PRIx8 " refused\n", known[x]);
 			return FALSE;
 		}
 	}
 	/* the color pointer (0x09) is not an [MS-RDPEMSC] update type */
-	if (rdpemsc_is_mouseptr_update_type((TS_UPDATETYPE_MOUSEPTR)0x09) ||
-	    rdpemsc_is_mouseptr_update_type((TS_UPDATETYPE_MOUSEPTR)0x00))
+	if (rdpemsc_is_mouseptr_update_type(0x09) || rdpemsc_is_mouseptr_update_type(0x00))
 	{
 		(void)fprintf(stderr, "pointer update: unknown type accepted\n");
 		return FALSE;
