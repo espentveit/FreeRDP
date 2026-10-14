@@ -37,6 +37,7 @@ static inline void coreinput_write_header(wStream* s, BYTE pduType, BYTE eventCo
 WINPR_ATTR_NODISCARD
 static inline BOOL coreinput_write_init_request(wStream* s)
 {
+	WINPR_ASSERT(s);
 	if (!Stream_EnsureRemainingCapacity(s, COREINPUT_HEADER_LENGTH + 12))
 		return FALSE;
 	coreinput_write_header(s, COREINPUT_PDUTYPE_CS_INIT_REQUEST, 0);
@@ -53,11 +54,13 @@ WINPR_ATTR_NODISCARD
 static inline BOOL coreinput_write_input_pdu(wStream* s, const BYTE* events, size_t length,
                                              size_t count)
 {
+	WINPR_ASSERT(s);
 	if (!events || (length == 0) || (count == 0) || (count > COREINPUT_MAX_EVENTS))
 		return FALSE;
 	if (!Stream_EnsureRemainingCapacity(s, COREINPUT_HEADER_LENGTH + length))
 		return FALSE;
-	coreinput_write_header(s, COREINPUT_PDUTYPE_CS_KEYBOARD_AND_MOUSE_INPUT, (BYTE)count);
+	coreinput_write_header(s, COREINPUT_PDUTYPE_CS_KEYBOARD_AND_MOUSE_INPUT,
+	                       WINPR_ASSERTING_INT_CAST(BYTE, count));
 	Stream_Write(s, events, length);
 	return TRUE;
 }
@@ -67,6 +70,7 @@ static inline BOOL coreinput_write_input_pdu(wStream* s, const BYTE* events, siz
 WINPR_ATTR_NODISCARD
 static inline UINT16 coreinput_read_init_response(wStream* s)
 {
+	WINPR_ASSERT(s);
 	if (!Stream_CheckAndLogRequiredLength("com.freerdp.channels.coreinput", s,
 	                                      COREINPUT_HEADER_LENGTH + 12))
 		return 0;

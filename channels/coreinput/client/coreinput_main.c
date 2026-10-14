@@ -20,6 +20,7 @@
 #include <winpr/crt.h>
 #include <winpr/assert.h>
 #include <winpr/stream.h>
+#include <winpr/interlocked.h>
 #include <winpr/synch.h>
 
 #include <freerdp/freerdp.h>
@@ -37,23 +38,67 @@
  * client supports, all fast-path input events go on the channel
  * (freerdp_input_set_events_redirect), and with it on the UDP multitransport tunnel once Soft-Sync
  * moved the channel there. */
+
+/* What a send uses. The plugin holds one reference and each redirect set with it another, which
+ * the core gives back once that redirect is gone and no send of it is in progress, so a send that
+ * is still running when the plugin terminates does not find it freed. */
 typedef struct
 {
-	GENERIC_DYNVC_PLUGIN base;
-	rdpContext* rdpcontext;
+	volatile LONG refs;
 
 	/* guards callback: a send holds it for its write, so the channel does not close under it */
 	CRITICAL_SECTION lock;
 	GENERIC_CHANNEL_CALLBACK* callback;
+} COREINPUT_SENDER;
+
+typedef struct
+{
+	GENERIC_DYNVC_PLUGIN base;
+	rdpContext* rdpcontext;
+	COREINPUT_SENDER* sender;
 } COREINPUT_PLUGIN;
+
+static void coreinput_sender_unref(void* custom)
+{
+	COREINPUT_SENDER* sender = custom;
+	if (!sender || (InterlockedDecrement(&sender->refs) != 0))
+		return;
+	DeleteCriticalSection(&sender->lock);
+	free(sender);
+}
+
+WINPR_ATTR_MALLOC(coreinput_sender_unref, 1)
+WINPR_ATTR_NODISCARD
+static COREINPUT_SENDER* coreinput_sender_new(void)
+{
+	COREINPUT_SENDER* sender = calloc(1, sizeof(COREINPUT_SENDER));
+	if (!sender)
+		return nullptr;
+	if (!InitializeCriticalSectionEx(&sender->lock, 0, 0))
+	{
+		free(sender);
+		return nullptr;
+	}
+	sender->refs = 1;
+	return sender;
+}
+
+static void coreinput_sender_set_callback(COREINPUT_SENDER* sender,
+                                          GENERIC_CHANNEL_CALLBACK* callback)
+{
+	WINPR_ASSERT(sender);
+	EnterCriticalSection(&sender->lock);
+	sender->callback = callback;
+	LeaveCriticalSection(&sender->lock);
+}
 
 /* The events of one fast-path input PDU, as an RDP_CORE_INPUT_CS_KEYBOARD_AND_MOUSE_INPUT_PDU.
  * Called by the core for each batch of input, see freerdp_input_set_events_redirect. */
 WINPR_ATTR_NODISCARD
 static BOOL coreinput_send_events(void* custom, const BYTE* events, size_t length, size_t count)
 {
-	COREINPUT_PLUGIN* coreinput = custom;
-	WINPR_ASSERT(coreinput);
+	COREINPUT_SENDER* sender = custom;
+	WINPR_ASSERT(sender);
 
 	wStream* s = Stream_New(nullptr, COREINPUT_HEADER_LENGTH + length);
 	if (!s)
@@ -64,12 +109,13 @@ static BOOL coreinput_send_events(void* custom, const BYTE* events, size_t lengt
 		goto out;
 	Stream_SealLength(s);
 
-	EnterCriticalSection(&coreinput->lock);
-	GENERIC_CHANNEL_CALLBACK* callback = coreinput->callback;
+	EnterCriticalSection(&sender->lock);
+	GENERIC_CHANNEL_CALLBACK* callback = sender->callback;
 	if (callback && callback->channel && callback->channel->Write)
-		rc = callback->channel->Write(callback->channel, (ULONG)Stream_Length(s), Stream_Buffer(s),
-		                              nullptr) == CHANNEL_RC_OK;
-	LeaveCriticalSection(&coreinput->lock);
+		rc = callback->channel->Write(callback->channel,
+		                              WINPR_ASSERTING_INT_CAST(ULONG, Stream_Length(s)),
+		                              Stream_Buffer(s), nullptr) == CHANNEL_RC_OK;
+	LeaveCriticalSection(&sender->lock);
 
 out:
 	Stream_Free(s, TRUE);
@@ -81,7 +127,7 @@ static void coreinput_stop_redirect(COREINPUT_PLUGIN* coreinput)
 	WINPR_ASSERT(coreinput);
 	if (coreinput->rdpcontext && coreinput->rdpcontext->input &&
 	    !freerdp_input_set_events_redirect(coreinput->rdpcontext->input, nullptr, nullptr,
-	                                       coreinput))
+	                                       coreinput->sender))
 		WLog_WARN(TAG, "input still goes on the core input channel");
 }
 
@@ -103,13 +149,12 @@ static UINT coreinput_on_open(IWTSVirtualChannelCallback* pChannelCallback)
 	if (!coreinput_write_init_request(s))
 		return ERROR_INTERNAL_ERROR;
 
-	EnterCriticalSection(&coreinput->lock);
-	coreinput->callback = callback;
-	LeaveCriticalSection(&coreinput->lock);
+	coreinput_sender_set_callback(coreinput->sender, callback);
 
-	WLog_DBG(TAG, "sending Init Request, version 0x%04x", COREINPUT_PROTOCOL_VERSION_1_0);
-	return callback->channel->Write(callback->channel, (ULONG)Stream_GetPosition(s), buffer,
-	                                nullptr);
+	WLog_DBG(TAG, "sending Init Request, version 0x%04" PRIx16,
+	         (UINT16)COREINPUT_PROTOCOL_VERSION_1_0);
+	return callback->channel->Write(
+	    callback->channel, WINPR_ASSERTING_INT_CAST(ULONG, Stream_GetPosition(s)), buffer, nullptr);
 }
 
 /* [MS-RDPECI] 3.2.5.2: with a supported version the input goes on the channel from now on. */
@@ -122,6 +167,7 @@ static UINT coreinput_on_data_received(IWTSVirtualChannelCallback* pChannelCallb
 	COREINPUT_PLUGIN* coreinput = (COREINPUT_PLUGIN*)callback->plugin;
 	WINPR_ASSERT(coreinput);
 	WINPR_ASSERT(coreinput->rdpcontext);
+	WINPR_ASSERT(coreinput->sender);
 
 	const UINT16 version = coreinput_read_init_response(data);
 	if (version != COREINPUT_PROTOCOL_VERSION_1_0)
@@ -133,9 +179,14 @@ static UINT coreinput_on_data_received(IWTSVirtualChannelCallback* pChannelCallb
 		return CHANNEL_RC_OK;
 	}
 
+	/* the redirect holds a reference on the sender, the core gives it back */
+	(void)InterlockedIncrement(&coreinput->sender->refs);
 	if (!freerdp_input_set_events_redirect(coreinput->rdpcontext->input, coreinput_send_events,
-	                                       nullptr, coreinput))
+	                                       coreinput_sender_unref, coreinput->sender))
+	{
+		coreinput_sender_unref(coreinput->sender);
 		return CHANNEL_RC_NO_MEMORY;
+	}
 	WLog_DBG(TAG, "core input version 0x%04" PRIx16 ", input goes on the channel", version);
 	return CHANNEL_RC_OK;
 }
@@ -149,14 +200,16 @@ static UINT coreinput_on_close(IWTSVirtualChannelCallback* pChannelCallback)
 
 	COREINPUT_PLUGIN* coreinput = (COREINPUT_PLUGIN*)callback->plugin;
 	WINPR_ASSERT(coreinput);
+	COREINPUT_SENDER* sender = coreinput->sender;
+	WINPR_ASSERT(sender);
 
 	/* fast-path input again; a send in progress holds the lock until its write is done */
 	coreinput_stop_redirect(coreinput);
-	EnterCriticalSection(&coreinput->lock);
-	if (coreinput->callback == callback)
-		coreinput->callback = nullptr;
+	EnterCriticalSection(&sender->lock);
+	if (sender->callback == callback)
+		sender->callback = nullptr;
 	free(callback);
-	LeaveCriticalSection(&coreinput->lock);
+	LeaveCriticalSection(&sender->lock);
 	return CHANNEL_RC_OK;
 }
 
@@ -167,7 +220,9 @@ static UINT init_plugin_cb(GENERIC_DYNVC_PLUGIN* base, rdpContext* rcontext,
 	COREINPUT_PLUGIN* coreinput = (COREINPUT_PLUGIN*)base;
 	WINPR_ASSERT(coreinput);
 
-	InitializeCriticalSection(&coreinput->lock);
+	coreinput->sender = coreinput_sender_new();
+	if (!coreinput->sender)
+		return CHANNEL_RC_NO_MEMORY;
 	coreinput->rdpcontext = rcontext;
 	return CHANNEL_RC_OK;
 }
@@ -177,8 +232,14 @@ static void terminate_plugin_cb(GENERIC_DYNVC_PLUGIN* base)
 	COREINPUT_PLUGIN* coreinput = (COREINPUT_PLUGIN*)base;
 	WINPR_ASSERT(coreinput);
 
+	if (!coreinput->sender)
+		return;
+
+	/* a send still in progress keeps the sender until it is done */
 	coreinput_stop_redirect(coreinput);
-	DeleteCriticalSection(&coreinput->lock);
+	coreinput_sender_set_callback(coreinput->sender, nullptr);
+	coreinput_sender_unref(coreinput->sender);
+	coreinput->sender = nullptr;
 }
 
 static const IWTSVirtualChannelCallback coreinput_functions = { coreinput_on_data_received,

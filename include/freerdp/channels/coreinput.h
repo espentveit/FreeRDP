@@ -41,7 +41,7 @@ extern "C"
 
 	/** [MS-RDPECI] 2.2.2.1 pduType
 	 *  @since version 3.33.0 */
-	typedef enum
+	typedef enum WINPR_C23_ENUM_TYPE(uint8_t)
 	{
 		COREINPUT_PDUTYPE_CS_INIT_REQUEST = 0x01,
 		COREINPUT_PDUTYPE_SC_INIT_RESPONSE = 0x02,
