@@ -56,9 +56,10 @@ static UINT rdpemsc_on_open(IWTSVirtualChannelCallback* pChannelCallback)
 	if (!rdpemsc_write_caps_advertise(s))
 		return ERROR_INTERNAL_ERROR;
 
-	WLog_DBG(TAG, "sending Caps Advertise, version %d", RDP_MOUSE_CURSOR_CAPVERSION_1);
-	return callback->channel->Write(callback->channel, (ULONG)Stream_GetPosition(s), buffer,
-	                                nullptr);
+	WLog_DBG(TAG, "sending Caps Advertise, version %" PRIu32,
+	         (UINT32)RDP_MOUSE_CURSOR_CAPVERSION_1);
+	return callback->channel->Write(
+	    callback->channel, WINPR_ASSERTING_INT_CAST(ULONG, Stream_GetPosition(s)), buffer, nullptr);
 }
 
 WINPR_ATTR_NODISCARD
@@ -71,11 +72,12 @@ static UINT rdpemsc_on_data_received(IWTSVirtualChannelCallback* pChannelCallbac
 	WINPR_ASSERT(rdpemsc);
 	WINPR_ASSERT(rdpemsc->rdpcontext);
 
-	RDP_MOUSE_CURSOR_HEADER header = WINPR_C_ARRAY_INIT;
-	if (!rdpemsc_read_header(data, &header))
+	BYTE pduType = 0;
+	BYTE updateType = 0;
+	if (!rdpemsc_read_header(data, &pduType, &updateType))
 		return ERROR_INVALID_DATA;
 
-	switch (header.pduType)
+	switch (pduType)
 	{
 		case PDUTYPE_SC_CAPS_CONFIRM:
 		{
@@ -83,27 +85,27 @@ static UINT rdpemsc_on_data_received(IWTSVirtualChannelCallback* pChannelCallbac
 			if (version == RDP_MOUSE_CURSOR_CAPVERSION_INVALID)
 				WLog_WARN(TAG, "Caps Confirm without a valid capability set");
 			else
-				WLog_DBG(TAG, "Caps Confirm, version %d: pointer updates come on the channel",
-				         version);
+				WLog_DBG(TAG,
+				         "Caps Confirm, version %" PRIu32 ": pointer updates come on the channel",
+				         (UINT32)version);
 			return CHANNEL_RC_OK;
 		}
 
 		case PDUTYPE_SC_MOUSEPTR_UPDATE:
-			if (!rdpemsc_is_mouseptr_update_type(header.updateType))
+			if (!rdpemsc_is_mouseptr_update_type(updateType))
 			{
-				WLog_WARN(TAG, "unknown pointer update type 0x%02x, ignored", header.updateType);
+				WLog_WARN(TAG, "unknown pointer update type 0x%02" PRIx8 ", ignored", updateType);
 				return CHANNEL_RC_OK;
 			}
-			if (!freerdp_update_recv_pointer(rdpemsc->rdpcontext->update, (UINT16)header.updateType,
-			                                 data))
+			if (!freerdp_update_recv_pointer(rdpemsc->rdpcontext->update, updateType, data))
 			{
-				WLog_WARN(TAG, "pointer update type 0x%02x failed", header.updateType);
+				WLog_WARN(TAG, "pointer update type 0x%02" PRIx8 " failed", updateType);
 				return ERROR_INVALID_DATA;
 			}
 			return CHANNEL_RC_OK;
 
 		default:
-			WLog_WARN(TAG, "unknown PDU type 0x%02x, ignored", header.pduType);
+			WLog_WARN(TAG, "unknown PDU type 0x%02" PRIx8 ", ignored", pduType);
 			return CHANNEL_RC_OK;
 	}
 }

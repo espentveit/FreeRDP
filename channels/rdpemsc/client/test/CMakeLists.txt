@@ -1,19 +1,29 @@
-set(MODULE_NAME "TestRdpemsc")
-set(MODULE_PREFIX "TEST_RDPEMSC")
+if(BUILD_FUZZERS)
+  include(AddFuzzerTest)
 
-disable_warnings_for_directory(${CMAKE_CURRENT_BINARY_DIR})
+  set(FUZZERS TestFuzzChannelRdpemsc.c)
 
-set(DRIVER ${MODULE_NAME}.c)
-set(TESTS TestRdpemscPdu.c)
+  add_fuzzer_test("${FUZZERS}" "winpr freerdp freerdp-client")
+endif()
 
-create_test_sourcelist(SRCS ${DRIVER} ${TESTS})
-add_executable(${MODULE_NAME} ${SRCS})
-target_link_libraries(${MODULE_NAME} PRIVATE winpr freerdp)
-set_target_properties(${MODULE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TESTING_OUTPUT_DIRECTORY}")
+if(BUILD_TESTING_INTERNAL)
+  set(MODULE_NAME "TestRdpemsc")
+  set(MODULE_PREFIX "TEST_RDPEMSC")
 
-foreach(test ${TESTS})
-  get_filename_component(TestName ${test} NAME_WE)
-  add_test(${TestName} ${TESTING_OUTPUT_DIRECTORY}/${MODULE_NAME} ${TestName})
-endforeach()
+  disable_warnings_for_directory(${CMAKE_CURRENT_BINARY_DIR})
 
-set_property(TARGET ${MODULE_NAME} PROPERTY FOLDER "FreeRDP/Channel/Test")
+  set(DRIVER ${MODULE_NAME}.c)
+  set(TESTS TestRdpemscPdu.c)
+
+  create_test_sourcelist(SRCS ${DRIVER} ${TESTS})
+  add_executable(${MODULE_NAME} ${SRCS})
+  target_link_libraries(${MODULE_NAME} PRIVATE winpr freerdp)
+  set_target_properties(${MODULE_NAME} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${TESTING_OUTPUT_DIRECTORY}")
+
+  foreach(test ${TESTS})
+    get_filename_component(TestName ${test} NAME_WE)
+    add_test(${TestName} ${TESTING_OUTPUT_DIRECTORY}/${MODULE_NAME} ${TestName})
+  endforeach()
+
+  set_property(TARGET ${MODULE_NAME} PROPERTY FOLDER "FreeRDP/Channel/Test")
+endif()

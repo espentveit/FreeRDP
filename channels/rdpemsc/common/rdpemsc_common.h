@@ -32,6 +32,7 @@
 WINPR_ATTR_NODISCARD
 static inline BOOL rdpemsc_write_caps_advertise(wStream* s)
 {
+	WINPR_ASSERT(s);
 	if (!Stream_EnsureRemainingCapacity(s, RDPEMSC_HEADER_SIZE + RDPEMSC_CAPSET_V1_SIZE))
 		return FALSE;
 	Stream_Write_UINT8(s, PDUTYPE_CS_CAPS_ADVERTISE);      /* pduType */
@@ -43,16 +44,19 @@ static inline BOOL rdpemsc_write_caps_advertise(wStream* s)
 	return TRUE;
 }
 
-/* [MS-RDPEMSC] 2.2.2.1 RDP_MOUSE_CURSOR_HEADER */
+/* [MS-RDPEMSC] 2.2.2.1 RDP_MOUSE_CURSOR_HEADER. pduType and updateType are passed on as they
+ * came: they need not be RDP_MOUSE_CURSOR_PDUTYPE or TS_UPDATETYPE_MOUSEPTR values. */
 WINPR_ATTR_NODISCARD
-static inline BOOL rdpemsc_read_header(wStream* s, RDP_MOUSE_CURSOR_HEADER* header)
+static inline BOOL rdpemsc_read_header(wStream* s, BYTE* pduType, BYTE* updateType)
 {
-	WINPR_ASSERT(header);
+	WINPR_ASSERT(s);
+	WINPR_ASSERT(pduType);
+	WINPR_ASSERT(updateType);
 	if (!Stream_CheckAndLogRequiredLength("com.freerdp.channels.rdpemsc", s, RDPEMSC_HEADER_SIZE))
 		return FALSE;
-	header->pduType = (RDP_MOUSE_CURSOR_PDUTYPE)Stream_Get_UINT8(s);
-	header->updateType = (TS_UPDATETYPE_MOUSEPTR)Stream_Get_UINT8(s);
-	header->reserved = Stream_Get_UINT16(s);
+	*pduType = Stream_Get_UINT8(s);
+	*updateType = Stream_Get_UINT8(s);
+	Stream_Seek(s, 2); /* reserved */
 	return TRUE;
 }
 
@@ -61,6 +65,7 @@ static inline BOOL rdpemsc_read_header(wStream* s, RDP_MOUSE_CURSOR_HEADER* head
 WINPR_ATTR_NODISCARD
 static inline RDP_MOUSE_CURSOR_CAPVERSION rdpemsc_read_caps_confirm(wStream* s)
 {
+	WINPR_ASSERT(s);
 	if (!Stream_CheckAndLogRequiredLength("com.freerdp.channels.rdpemsc", s, 12))
 		return RDP_MOUSE_CURSOR_CAPVERSION_INVALID;
 
@@ -78,7 +83,7 @@ static inline RDP_MOUSE_CURSOR_CAPVERSION rdpemsc_read_caps_confirm(wStream* s)
 /* [MS-RDPEMSC] 2.2.3.3: the update types of RDP_MOUSE_CURSOR_MOUSEPTR_UPDATE_PDU, which are the
  * fast-path pointer update types with the same payloads */
 WINPR_ATTR_NODISCARD
-static inline BOOL rdpemsc_is_mouseptr_update_type(TS_UPDATETYPE_MOUSEPTR updateType)
+static inline BOOL rdpemsc_is_mouseptr_update_type(BYTE updateType)
 {
 	switch (updateType)
 	{

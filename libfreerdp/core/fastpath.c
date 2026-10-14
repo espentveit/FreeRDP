@@ -475,8 +475,8 @@ BOOL freerdp_update_recv_pointer(rdpUpdate* update, UINT16 updateType, wStream* 
 	/* a channel delivers on its own thread, the update lock keeps it apart from the others */
 	BOOL rc = FALSE;
 	rdp_update_lock(update);
-	const BOOL known =
-	    fastpath_recv_pointer_update(update, (BYTE)updateType, s, defaultReturn, &rc);
+	const BOOL known = fastpath_recv_pointer_update(
+	    update, WINPR_ASSERTING_INT_CAST(BYTE, updateType), s, defaultReturn, &rc);
 	rdp_update_unlock(update);
 
 	if (!known)
