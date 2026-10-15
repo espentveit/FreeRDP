@@ -85,12 +85,6 @@ extern "C"
 	FREERDP_API BOOL freerdp_multitransport_send_dvc(rdpContext* context, UINT32 tunnelType,
 	                                                 const BYTE* data, size_t length);
 
-	/** @brief Sends the dynamic virtual channel PDUs a server gathered for a tunnel.
-	 *  @since version 3.33.0
-	 */
-	WINPR_ATTR_NODISCARD
-	FREERDP_API BOOL freerdp_multitransport_flush_dvc(rdpContext* context, UINT32 tunnelType);
-
 #ifdef __cplusplus
 }
 #endif

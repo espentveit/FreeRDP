@@ -947,10 +947,9 @@ BOOL freerdp_multitransport_send_dvc(rdpContext* context, UINT32 tunnelType, con
 	return rc;
 }
 
-BOOL freerdp_multitransport_flush_dvc(rdpContext* context, UINT32 tunnelType)
+BOOL multitransport_flush_dvc(rdpMultitransport* multi)
 {
-	rdpMultitransport* multi = multitransport_from_context(context);
-	if (!multi || (tunnelType != TUNNELTYPE_UDPFECR))
+	if (!multi)
 		return FALSE;
 
 	BOOL rc = FALSE;

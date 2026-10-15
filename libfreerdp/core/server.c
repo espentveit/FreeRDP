@@ -997,8 +997,9 @@ BOOL WTSVirtualChannelManagerCheckFileDescriptorEx(HANDLE hServer, BOOL autoOpen
 			tunnelWritten = TRUE;
 	}
 
+	WINPR_ASSERT(!tunnelWritten || vcm->client->context->rdp);
 	if (status && tunnelWritten &&
-	    !freerdp_multitransport_flush_dvc(vcm->client->context, TUNNELTYPE_UDPFECR))
+	    !multitransport_flush_dvc(vcm->client->context->rdp->multitransport))
 	{
 		WLog_ERR(TAG, "cannot write dynamic channel PDUs on the UDP tunnel");
 		status = FALSE;
